@@ -238,7 +238,18 @@ class Proxy
         )));
         $answer = @file_get_contents($url, false, $context);
         $result['body'] = $answer === false ? '' : $answer;
-        foreach (isset($http_response_header) ? $http_response_header : array() as $line) {
+        // PHP 8.4 added http_get_last_response_headers(); 8.5 deprecated the
+        // $http_response_header variable this fell back on. The old name is
+        // reached through get_defined_vars() so that naming it cannot raise
+        // the deprecation on 8.5, while 7.4 still gets its headers.
+        if (function_exists('http_get_last_response_headers')) {
+            $lines = http_get_last_response_headers();
+            $lines = $lines === null ? array() : $lines;
+        } else {
+            $scope = get_defined_vars();
+            $lines = isset($scope['http_response_header']) ? $scope['http_response_header'] : array();
+        }
+        foreach ($lines as $line) {
             if (preg_match('#^HTTP/\S+\s+(\d{3})#', $line, $m)) {
                 $result['status'] = (int) $m[1];
             } elseif (strpos($line, ':') !== false) {

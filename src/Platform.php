@@ -189,7 +189,7 @@ class Platform
 
     // The answer when the address belongs to the proxy, else null. $headers
     // and $body default to this request's; a framework passes its own.
-    public function proxyResponse($path, $method = 'GET', $query = '', array $headers = null, $body = null, $ip = null)
+    public function proxyResponse($path, $method = 'GET', $query = '', ?array $headers = null, $body = null, $ip = null)
     {
         $proxy = $this->proxy();
         if ($proxy === null) {
