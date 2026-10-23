@@ -1,5 +1,5 @@
 {
-  "name": "analytics/platform",
+  "name": "analytics-platform/platform",
   "description": "Firewall, error monitoring and server analytics for your PHP or Laravel site, run from your analytics dashboard.",
   "type": "library",
   "license": "MIT",

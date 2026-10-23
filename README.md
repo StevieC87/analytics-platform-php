@@ -1,4 +1,4 @@
-# analytics/platform (PHP)
+# analytics-platform/platform (PHP)
 
 One package for your PHP site's server, run from your analytics dashboard: a
 **firewall**, **error monitoring** and **server analytics** (payments,
@@ -6,7 +6,7 @@ sign-ups, leads). PHP 7.4 or later, no dependencies. For WordPress, use the
 Site Analytics plugin (`sdk/wordpress-plugin`), which is built on this.
 
 ```bash
-composer require analytics/platform
+composer require analytics-platform/platform
 ```
 
 ```php
@@ -96,7 +96,7 @@ The visit is read from the `X-Analytics-Session` header (send
 
 ## Laravel
 
-`composer require analytics/platform` is all: package discovery adds the
+`composer require analytics-platform/platform` is all: package discovery adds the
 middleware in front of every request, and errors Laravel reports go to the
 Errors report too. Set in `.env`:
 
