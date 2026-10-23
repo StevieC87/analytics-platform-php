@@ -1,0 +1,37 @@
+{
+  "name": "analytics/platform",
+  "description": "Firewall, error monitoring and server analytics for your PHP or Laravel site, run from your analytics dashboard.",
+  "type": "library",
+  "license": "MIT",
+  "authors": [
+    { "name": "steviec87" }
+  ],
+  "keywords": [
+    "firewall",
+    "waf",
+    "rate-limit",
+    "error-monitoring",
+    "analytics",
+    "server-monitoring",
+    "laravel",
+    "security"
+  ],
+  "require": {
+    "php": ">=7.4"
+  },
+  "suggest": {
+    "ext-apcu": "Needed for the rate limit (or pass your own counter)"
+  },
+  "autoload": {
+    "psr-4": {
+      "AnalyticsPlatform\\": "src/"
+    }
+  },
+  "extra": {
+    "laravel": {
+      "providers": [
+        "AnalyticsPlatform\\Laravel\\FirewallServiceProvider"
+      ]
+    }
+  }
+}

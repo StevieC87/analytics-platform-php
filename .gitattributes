@@ -1,0 +1,4 @@
+# Keep the Composer download to what a dependent actually needs.
+/test            export-ignore
+/.gitattributes  export-ignore
+/.gitignore      export-ignore

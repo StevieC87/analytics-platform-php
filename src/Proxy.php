@@ -1,0 +1,265 @@
+<?php
+// First-party proxy: serving the tracker from the site's own domain, so ad
+// blockers don't hide visitors.
+//
+// Blockers stop analytics by recognising the address a script comes from and
+// what it is called ("track.js", "collect"). The answer is to serve both from
+// the site's own domain, which until now meant writing Nginx, Apache or
+// Cloudflare rules by hand. This app is already a server on that domain, so
+// the package does it itself:
+//
+//   <prefix>/js/<rest>   ->  <endpoint>/<rest>                  (tracker files)
+//   <prefix>/api/<rest>  ->  <endpoint>/collectanalytics/<rest> (the collector)
+//
+// The same two rules as the hand-written ones, so one install check covers
+// both. The prefix comes from the site secret: not guessable from the page,
+// and the same every time, so a browser's cache and a CDN in front stay valid.
+//
+// It answers before every other module: a visitor's beacon is our own
+// traffic, not a page of the site, so it shouldn't be counted, timed or
+// turned away by the firewall's rate limit.
+//
+// Deliberately free of Core, so the WordPress plugin's px.php — which is
+// reached without loading WordPress at all — can use the same code.
+
+namespace AnalyticsPlatform;
+
+class Proxy
+{
+    // The tracker files, by name: anything else is refused, not forwarded.
+    const FILES = array('track.js', 's.js', 'snapshot.js', 'replay.js', 'survey.js', 'banner.js',
+        'leadform.js', 'notice.js', 'editor.js', 'picker.js', 'feedback.js', 'shield.js');
+    // A pinned version never changes; /v<major>/ follows new releases, so it
+    // is held for an hour, the same as the collector serves it with.
+    const TTL_PINNED = 604800;
+    const TTL_MAJOR = 3600;
+    const TIMEOUT = 5;
+    const MAX_BODY = 6291456;
+    // The collector reads these; everything else, cookies above all, stays here.
+    const PASS_HEADERS = array('content-type' => 'Content-Type', 'user-agent' => 'User-Agent',
+        'accept-language' => 'Accept-Language', 'referer' => 'Referer', 'origin' => 'Origin',
+        'sec-fetch-site' => 'Sec-Fetch-Site', 'sec-ch-ua' => 'Sec-CH-UA',
+        'sec-ch-ua-mobile' => 'Sec-CH-UA-Mobile', 'sec-ch-ua-platform' => 'Sec-CH-UA-Platform');
+
+    private $endpoint;
+    private $prefix;
+    private $dir;
+
+    // $dir: a writable folder for the copy of each tracker file. PHP keeps
+    // nothing between requests, so without one every visitor costs us a fetch.
+    public function __construct($endpoint, $secret, $dir = '', $prefix = '')
+    {
+        $this->endpoint = rtrim((string) $endpoint, '/');
+        $this->dir = (string) $dir;
+        $this->prefix = preg_replace('/[^A-Za-z0-9_-]/', '', $prefix !== '' ? (string) $prefix : self::prefixFor($secret));
+    }
+
+    public static function prefixFor($secret)
+    {
+        return substr(hash('sha256', 'proxy|' . (string) $secret), 0, 8);
+    }
+
+    public function prefix()
+    {
+        return $this->prefix;
+    }
+
+    // The tracker's address on this site, for the page's script tag.
+    public function scriptUrl($version = '1')
+    {
+        return '/' . $this->prefix . '/js/v' . $version . '/s.js';
+    }
+
+    // Where visits are sent, for the tag's data-collect.
+    public function collectUrl()
+    {
+        return '/' . $this->prefix . '/api/e';
+    }
+
+    // array($kind, $rest) when the address is ours, else null. $kind 'bad' is
+    // ours but not allowed: answer 404 rather than handing it to the app.
+    public function match($path)
+    {
+        if ($this->prefix === '' || $this->endpoint === '') {
+            return null;
+        }
+        $head = '/' . $this->prefix . '/';
+        if (strncmp((string) $path, $head, strlen($head)) !== 0) {
+            return null;
+        }
+        $rest = substr((string) $path, strlen($head));
+        foreach (array('js', 'api') as $kind) {
+            if (strncmp($rest, $kind . '/', strlen($kind) + 1) === 0) {
+                $tail = substr($rest, strlen($kind) + 1);
+                $ok = $tail !== '' && strpos($tail, '..') === false && preg_match('#^[A-Za-z0-9/_.-]{1,120}$#', $tail);
+                return $ok ? array($kind, $tail) : array('bad', '');
+            }
+        }
+        return array('bad', '');
+    }
+
+    // array('status' => int, 'headers' => array(name => value), 'body' => string).
+    public function handle($kind, $rest, $method = 'GET', $query = '', array $headers = array(), $body = null, $clientIp = '')
+    {
+        if ($kind === 'js') {
+            return $this->file($rest);
+        }
+        if ($kind !== 'api') {
+            return self::notFound();
+        }
+        return $this->collector($rest, $method, $query, $headers, $body, $clientIp);
+    }
+
+    private static function notFound()
+    {
+        return array('status' => 404, 'headers' => array('Content-Type' => 'text/plain; charset=utf-8'), 'body' => 'Not found');
+    }
+
+    private function file($rest)
+    {
+        if (!preg_match('#^v(\d+(?:\.\d+\.\d+)?)/([a-z]+\.js)$#', $rest, $found) || !in_array($found[2], self::FILES, true)) {
+            return self::notFound();
+        }
+        $pinned = strpos($found[1], '.') !== false;
+        $cache = $this->dir !== '' && is_dir($this->dir) ? $this->dir . '/px-' . hash('sha256', $rest) . '.js' : '';
+        $body = false;
+        if ($cache !== '') {
+            clearstatcache(true, $cache);
+            if (is_file($cache) && filemtime($cache) > time() - ($pinned ? self::TTL_PINNED : self::TTL_MAJOR)) {
+                $body = @file_get_contents($cache);
+            }
+        }
+        if ($body === false) {
+            $answer = $this->send('GET', $this->endpoint . '/' . $rest, null, array());
+            if ($answer['status'] === 200 && strlen($answer['body']) > 500) {
+                $body = $answer['body'];
+                if ($cache !== '') {
+                    // Written beside it and moved into place, so a
+                    // half-written file is never served.
+                    $tmp = $cache . '.' . getmypid();
+                    if (@file_put_contents($tmp, $body) !== false) {
+                        @rename($tmp, $cache);
+                    } else {
+                        @unlink($tmp);
+                    }
+                }
+            } elseif ($cache !== '' && is_file($cache)) {
+                // Upstream is unreachable: an old copy beats no tracker at all.
+                $body = @file_get_contents($cache);
+            }
+        }
+        if ($body === false || $body === '') {
+            return array('status' => 502, 'headers' => array(), 'body' => '');
+        }
+        return array('status' => 200, 'body' => $body, 'headers' => array(
+            'Content-Type' => 'application/javascript; charset=utf-8',
+            'Cache-Control' => $pinned ? 'public, max-age=31536000, immutable' : 'public, max-age=3600',
+            'X-Content-Type-Options' => 'nosniff',
+        ));
+    }
+
+    private function collector($rest, $method, $query, array $headers, $body, $clientIp)
+    {
+        $method = strtoupper((string) $method);
+        if ($method === 'OPTIONS') {
+            // Same origin as the page, so a preflight shouldn't happen;
+            // answer it cheaply rather than passing it on.
+            return array('status' => 204, 'body' => '', 'headers' => array(
+                'Access-Control-Allow-Methods' => 'GET, POST, OPTIONS',
+                'Access-Control-Allow-Headers' => 'Content-Type',
+                'Access-Control-Max-Age' => '86400',
+            ));
+        }
+        if ($method !== 'GET' && $method !== 'POST') {
+            return self::notFound();
+        }
+        if ($body !== null && strlen($body) > self::MAX_BODY) {
+            return array('status' => 413, 'headers' => array(), 'body' => '');
+        }
+        // The visitor's address: the collector needs it for the country, the
+        // daily visitor ID and the per-visitor rate limit.
+        $out = array('X-Forwarded-For: ' . (string) $clientIp);
+        foreach (self::PASS_HEADERS as $key => $name) {
+            if (!empty($headers[$key])) {
+                $out[] = $name . ': ' . str_replace(array("\r", "\n"), '', (string) $headers[$key]);
+            }
+        }
+        $url = $this->endpoint . '/collectanalytics/' . $rest . ($query !== '' ? '?' . $query : '');
+        $answer = $this->send($method, $url, $method === 'POST' ? (string) $body : null, $out);
+        if ($answer['status'] === 0) {
+            // The tracker already treats a failed beacon as lost and carries on.
+            return array('status' => 502, 'headers' => array(), 'body' => '');
+        }
+        $pass = array();
+        foreach (array('content-type' => 'Content-Type', 'cache-control' => 'Cache-Control', 'retry-after' => 'Retry-After') as $key => $name) {
+            if (isset($answer['headers'][$key])) {
+                $pass[$name] = $answer['headers'][$key];
+            }
+        }
+        return array('status' => $answer['status'], 'headers' => $pass, 'body' => $answer['body']);
+    }
+
+    // Sends it upstream. cURL when it exists (nearly always), else streams,
+    // so a host without cURL still works.
+    private function send($method, $url, $body, array $headers)
+    {
+        $result = array('status' => 0, 'body' => '', 'headers' => array());
+        if (function_exists('curl_init')) {
+            $ch = curl_init($url);
+            curl_setopt_array($ch, array(
+                CURLOPT_CUSTOMREQUEST => $method,
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_TIMEOUT => self::TIMEOUT,
+                CURLOPT_CONNECTTIMEOUT => self::TIMEOUT,
+                CURLOPT_HTTPHEADER => $headers,
+                CURLOPT_HEADERFUNCTION => function ($ch, $line) use (&$result) {
+                    $pair = explode(':', $line, 2);
+                    if (count($pair) === 2) {
+                        $result['headers'][strtolower(trim($pair[0]))] = trim($pair[1]);
+                    }
+                    return strlen($line);
+                },
+            ));
+            if ($body !== null) {
+                curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+            }
+            $answer = curl_exec($ch);
+            $result['status'] = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+            $result['body'] = $answer === false ? '' : $answer;
+            curl_close($ch);
+            return $result;
+        }
+        $context = stream_context_create(array('http' => array(
+            'method' => $method,
+            'header' => implode("\r\n", $headers),
+            'content' => $body === null ? '' : $body,
+            'timeout' => self::TIMEOUT,
+            'ignore_errors' => true,
+        )));
+        $answer = @file_get_contents($url, false, $context);
+        $result['body'] = $answer === false ? '' : $answer;
+        foreach (isset($http_response_header) ? $http_response_header : array() as $line) {
+            if (preg_match('#^HTTP/\S+\s+(\d{3})#', $line, $m)) {
+                $result['status'] = (int) $m[1];
+            } elseif (strpos($line, ':') !== false) {
+                $pair = explode(':', $line, 2);
+                $result['headers'][strtolower(trim($pair[0]))] = trim($pair[1]);
+            }
+        }
+        return $result;
+    }
+
+    // Answers the request being served and stops. For plain PHP and the
+    // WordPress plugin's px.php; a framework builds its own response instead.
+    public function respond(array $answer)
+    {
+        http_response_code($answer['status']);
+        foreach ($answer['headers'] as $name => $value) {
+            header($name . ': ' . $value);
+        }
+        if ($answer['body'] !== '') {
+            header('Content-Length: ' . strlen($answer['body']));
+            echo $answer['body'];
+        }
+    }
+}
