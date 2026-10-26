@@ -106,35 +106,13 @@ class Posture
 
     // ---- The folders to walk -------------------------------------------------
 
-    private static function clean($path)
-    {
-        return rtrim(str_replace('\\', '/', (string) $path), '/');
-    }
-
     public function roots()
     {
-        $roots = array();
         $given = (array) $this->options['roots'];
         if (!$given && !empty($_SERVER['DOCUMENT_ROOT'])) {
             $given = array($_SERVER['DOCUMENT_ROOT']);
         }
-        foreach ($given as $root) {
-            $real = @realpath((string) $root);
-            if ($real && is_dir($real)) {
-                $roots[$real] = self::clean($real);
-            }
-        }
-        // A folder inside another one on the list is already covered: without
-        // this, every file under it would be reported twice.
-        $roots = array_values($roots);
-        return array_values(array_filter($roots, function ($root) use ($roots) {
-            foreach ($roots as $other) {
-                if ($other !== $root && strpos($root . '/', $other . '/') === 0) {
-                    return false;
-                }
-            }
-            return true;
-        }));
+        return Files::realRoots($given);
     }
 
     // ---- The php.ini settings any PHP site has ------------------------------
@@ -161,7 +139,7 @@ class Posture
     // Is this path inside one of the web folders?
     private function inWebroot($path)
     {
-        $path = self::clean(@realpath($path) ? realpath($path) : $path);
+        $path = Files::clean(@realpath($path) ? realpath($path) : $path);
         if (!$path) {
             return false;
         }
@@ -233,7 +211,7 @@ class Posture
         $perms = 0;
         $exclude = array();
         foreach ((array) $this->options['exclude'] as $dir) {
-            $exclude[] = self::clean(@realpath($dir) ? realpath($dir) : $dir) . '/';
+            $exclude[] = Files::clean(@realpath($dir) ? realpath($dir) : $dir) . '/';
         }
         foreach ($this->roots() as $root) {
             $queue = array(array($root, 0));
@@ -255,7 +233,7 @@ class Posture
                     if (@is_link($path)) {
                         continue;
                     }
-                    $relative = ltrim(substr(self::clean($path), strlen($root)), '/');
+                    $relative = ltrim(substr(Files::clean($path), strlen($root)), '/');
                     if (@is_dir($path)) {
                         if ($depth + 1 > self::MAX_DEPTH || in_array($name, self::$skipDirs, true)) {
                             // A version control folder in the web root is itself worth reporting.
@@ -267,7 +245,7 @@ class Posture
                         }
                         $skip = false;
                         foreach ($exclude as $out) {
-                            if (strpos(self::clean($path) . '/', $out) === 0) {
+                            if (strpos(Files::clean($path) . '/', $out) === 0) {
                                 $skip = true;
                             }
                         }
@@ -283,7 +261,7 @@ class Posture
                     if ($kind !== null && count($exposure) < self::MAX_EXPOSURE) {
                         $size = @filesize($path);
                         $mtime = @filemtime($path);
-                        $row = array('path' => self::utf8($relative), 'kind' => $kind);
+                        $row = array('path' => Files::utf8($relative), 'kind' => $kind);
                         if ($size !== false) {
                             $row['size'] = (int) $size;
                         }
@@ -297,7 +275,7 @@ class Posture
                         if (self::worldWritable($path)) {
                             $writable++;
                             if (count($examples) < 3) {
-                                $examples[] = self::utf8($relative);
+                                $examples[] = Files::utf8($relative);
                             }
                         }
                     }
@@ -309,12 +287,6 @@ class Posture
             }
         }
         return array($exposure, array('writable' => $writable, 'examples' => $examples, 'checked' => $perms, 'truncated' => $truncated));
-    }
-
-    // JSON needs UTF-8: a name that isn't is still reported, its bad bytes replaced.
-    private static function utf8($path)
-    {
-        return preg_match('//u', $path) ? $path : (function_exists('mb_convert_encoding') ? mb_convert_encoding($path, 'UTF-8', 'UTF-8') : rawurlencode($path));
     }
 
     // ---- Putting the report together ----------------------------------------

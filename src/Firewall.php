@@ -27,6 +27,17 @@ class Firewall
     const BATCH = 200;
     const SPOOL_MAX = 2000000; // bytes of events waiting; more are dropped
     const RULES = array('allow', 'deny', 'banned', 'lists', 'shared', 'goodbots');
+    // Cloudflare's published ranges (cloudflare.com/ips), the same list as
+    // sdk/protocols/cloudflare-ranges.json: CF-Connecting-IP is believed only
+    // from these, since anyone who reaches the origin directly can send it.
+    const CLOUDFLARE = array(
+        '173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22', '141.101.64.0/18',
+        '108.162.192.0/18', '190.93.240.0/20', '188.114.96.0/20', '197.234.240.0/22', '198.41.128.0/17',
+        '162.158.0.0/15', '104.16.0.0/13', '104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22',
+        '2400:cb00::/32', '2606:4700::/32', '2803:f800::/32', '2405:b500::/32', '2405:8100::/32',
+        '2a06:98c0::/29', '2c0f:f248::/32',
+    );
+    private static $cloudflare = null;
 
     private $options;
     private $core;
@@ -38,8 +49,9 @@ class Firewall
     // Options: site_id, secret, endpoint (required); storage (a writable
     // directory; default the system temp directory); trust_proxy (0: the
     // connection's address; a number of proxies in X-Forwarded-For;
-    // 'cloudflare': CF-Connecting-IP); mode ('monitor' or 'block', overrides
-    // the dashboard); counter (callable($key, $ttl): int, the hit count after
+    // 'cloudflare': CF-Connecting-IP, believed only from Cloudflare's own
+    // addresses); mode ('monitor' or 'block', overrides the dashboard);
+    // counter (callable($key, $ttl): int, the hit count after
     // adding one); platform (for the dashboard, default 'php'); on_block
     // (callable($decision), send your own response). $core: shared with the
     // other modules (Platform passes it).
@@ -115,7 +127,10 @@ class Firewall
         $direct = isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '';
         $trust = $this->options['trust_proxy'];
         if ($trust === 'cloudflare') {
-            return !empty($_SERVER['HTTP_CF_CONNECTING_IP']) ? trim($_SERVER['HTTP_CF_CONNECTING_IP']) : $direct;
+            if (empty($_SERVER['HTTP_CF_CONNECTING_IP']) || !self::fromCloudflare($direct)) {
+                return $direct;
+            }
+            return trim($_SERVER['HTTP_CF_CONNECTING_IP']);
         }
         $hops = (int) $trust;
         if ($hops > 0 && !empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
@@ -125,6 +140,19 @@ class Firewall
             }
         }
         return $direct;
+    }
+
+    // Whether the connection came from Cloudflare.
+    public static function fromCloudflare($ip)
+    {
+        $key = self::ipKey($ip);
+        if ($key === null) {
+            return false;
+        }
+        if (self::$cloudflare === null) {
+            self::$cloudflare = self::compileList(self::CLOUDFLARE);
+        }
+        return self::has(self::$cloudflare, $key);
     }
 
     // array('action' => 'allow' | 'block' | 'monitor', 'rule' => ..., 'status' => ...).
@@ -154,8 +182,6 @@ class Firewall
             $rule = 'request:' . $matched['id'];
         } elseif ($rules['rate'] && !self::has(isset($rules['goodbots']) ? $rules['goodbots'] : array(), $key) && $this->overRate($key, $rules['rate'])) {
             $rule = 'rate';
-            // Banned here straight away (with APCu); the report bans it on the site's other servers.
-            $this->banHere($key, isset($rules['ban']) ? $rules['ban'] : 0);
         }
         if ($rule === '') {
             return $allow;
@@ -173,6 +199,10 @@ class Firewall
         // Asking for a secret file: banned here (with APCu); the report bans it on the site's other servers.
         if ($rule === 'probe' && $action === 'block') {
             $this->banHere($key, $rules['probes']['ban']);
+        }
+        // Over the rate limit: the same, banned here only in block mode.
+        if ($rule === 'rate' && $action === 'block') {
+            $this->banHere($key, isset($rules['ban']) ? $rules['ban'] : 0);
         }
         $this->report(array(
             'at' => gmdate('Y-m-d\TH:i:s\Z'),
@@ -522,55 +552,32 @@ class Firewall
 
     private function report(array $event)
     {
-        if (!$this->core->ensureDir()) {
-            return;
+        if ($this->core->ensureDir() && $this->core->append('events', $event, self::SPOOL_MAX)) {
+            $this->reported = true;
         }
-        $file = $this->dir . '/events.jsonl';
-        clearstatcache(true, $file);
-        if (is_file($file) && filesize($file) > self::SPOOL_MAX) {
-            return;
-        }
-        @file_put_contents($file, json_encode($event) . "\n", FILE_APPEND | LOCK_EX);
-        $this->reported = true;
     }
 
     // Sends waiting events, grouped like the Node client does, at most every
     // FLUSH_EVERY seconds.
     public function flush($force = false)
     {
-        $file = $this->dir . '/events.jsonl';
-        $mark = $this->dir . '/flush.lock';
-        clearstatcache();
-        if (!is_file($file) || (!$force && is_file($mark) && filemtime($mark) > time() - self::FLUSH_EVERY)) {
-            return;
-        }
-        $lock = @fopen($mark, 'c');
-        if (!$lock || !flock($lock, LOCK_EX | LOCK_NB)) {
-            return;
-        }
-        @touch($mark);
-        $sending = $file . '.' . getmypid() . '.sending';
-        if (@rename($file, $sending)) {
+        $this->core->drain('events', self::FLUSH_EVERY, $force, function (array $events) {
             $groups = array();
-            foreach (file($sending, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: array() as $line) {
-                $event = json_decode($line, true);
-                if (!is_array($event) || empty($event['ip'])) {
+            foreach ($events as $event) {
+                if (empty($event['ip'])) {
                     continue;
                 }
-                $key = $event['ip'] . '|' . $event['rule'] . '|' . $event['action'] . '|' . $event['method'] . '|' . $event['path'];
+                $key = json_encode(array($event['ip'], $event['rule'], $event['action'], $event['method'], $event['path']));
                 if (isset($groups[$key])) {
                     $groups[$key]['hits']++;
                 } else {
                     $groups[$key] = $event + array('hits' => 1);
                 }
             }
-            @unlink($sending);
             foreach (array_chunk(array_values($groups), self::BATCH) as $batch) {
-                $this->core->http('POST', '/events/firewall/events', array('site_id' => (string) $this->opt('site_id'), 'events' => $batch));
+                $this->core->post('events', '/events/firewall/events', array('site_id' => (string) $this->opt('site_id'), 'events' => $batch), 'bearer');
             }
-        }
-        flock($lock, LOCK_UN);
-        fclose($lock);
+        });
     }
 
     // Runs at shutdown: finishes the response first where PHP-FPM allows,
@@ -580,7 +587,7 @@ class Firewall
         try {
             $rules = $this->rules();
             $dueSync = !$rules || time() >= $rules['fetched'] + $rules['sync'];
-            $dueFlush = $this->reported || is_file($this->dir . '/events.jsonl');
+            $dueFlush = $this->reported || $this->core->waiting('events');
             if (!$dueSync && !$dueFlush) {
                 return;
             }

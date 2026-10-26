@@ -89,15 +89,18 @@ class Forms
             }
         }
         $res = $this->core->http('POST', '/collectanalytics/shield/verify', $body, array(), 'body');
-        if ($res['status'] === 0 || $res['status'] >= 500 || $res['status'] === 403 || $res['status'] === 429) {
+        // A verdict, spam or not, is always a 200. Anything else (unreachable,
+        // a wrong secret, a request it couldn't read, over the limit) judged
+        // nothing, and must not look like protection that works.
+        $data = $res['status'] === 200 ? json_decode($res['body'], true) : null;
+        if (!is_array($data) || !isset($data['success'])) {
             return $unchecked;
         }
-        $data = json_decode($res['body'], true);
-        $spam = is_array($data) && isset($data['success']) && $data['success'] === false;
+        $spam = $data['success'] === false;
         return array(
             'ok' => !$spam,
             'spam' => $spam,
-            'reasons' => is_array($data) && isset($data['reasons']) && is_array($data['reasons']) ? $data['reasons'] : array(),
+            'reasons' => isset($data['reasons']) && is_array($data['reasons']) ? $data['reasons'] : array(),
             'checked' => true,
         );
     }

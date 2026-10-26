@@ -71,9 +71,12 @@ class RequestRules
     // A pattern can only come from us, but a careless one would be matched
     // against text an attacker chooses, in this very request, and PCRE can't be
     // timed out here. So the client checks the shape itself instead of trusting
-    // what it was handed: a quantifier on a group that itself repeats
-    // ("(a+)+") takes exponential time on input that nearly matches.
-    // Backreferences and lookbehind are refused for the same reason.
+    // what it was handed. A repeated group that can match the same text more
+    // than one way takes exponential time on input that nearly matches: it can
+    // when it holds a quantifier ("(a+)+", "(\w\d?)+") or an alternation
+    // ("(a|ab)*"), so a group followed by * + or { holds neither. Backreferences
+    // and lookbehind are refused too. The same check as the backend's
+    // (backend/services/firewall/requestRules.js), freeRepeats included.
     public static function safePattern($pattern)
     {
         if (!is_string($pattern) || $pattern === '' || strlen($pattern) > self::MAX_REGEX) {
@@ -82,37 +85,117 @@ class RequestRules
         if (preg_match('/\\\\[1-9]/', $pattern) || strpos($pattern, '(?<') !== false) {
             return false;
         }
+        // Per open group: whether anything in it, nested groups too, repeats or branches.
         $open = array();
-        for ($i = 0; $i < strlen($pattern); $i++) {
+        $length = strlen($pattern);
+        for ($i = 0; $i < $length; $i++) {
             $char = $pattern[$i];
             if ($char === '\\') {
                 $i++;
                 continue;
             }
             if ($char === '[') {
-                // A character class: quantifiers inside it are literals.
-                while ($i < strlen($pattern) && $pattern[$i] !== ']') {
+                // A character class: skip it whole, quantifiers inside it are literals.
+                while ($i < $length && $pattern[$i] !== ']') {
                     $i += $pattern[$i] === '\\' ? 2 : 1;
                 }
                 continue;
             }
             if ($char === '(') {
-                $open[] = $i;
+                $open[] = false;
+                // "(?:", "(?=", "(?!": that ? names the kind of group, it repeats nothing.
+                if (isset($pattern[$i + 1]) && $pattern[$i + 1] === '?') {
+                    $i += 2;
+                }
             } elseif ($char === ')') {
                 if (!$open) {
                     return false;
                 }
-                $start = array_pop($open);
+                $ambiguous = array_pop($open);
                 $next = isset($pattern[$i + 1]) ? $pattern[$i + 1] : '';
-                if ($next === '*' || $next === '+' || $next === '{') {
-                    $inside = substr($pattern, $start + 1, $i - $start - 1);
-                    if (preg_match('/(^|[^\\\\])[*+]/', $inside) || preg_match('/(^|[^\\\\])\{[0-9]/', $inside)) {
-                        return false;
-                    }
+                if ($ambiguous && ($next === '*' || $next === '+' || $next === '{')) {
+                    return false;
                 }
+                if ($ambiguous && $open) {
+                    $open[count($open) - 1] = true;
+                }
+            } elseif ($open && strpos('|*+?{', $char) !== false) {
+                $open[count($open) - 1] = true;
             }
         }
-        return !$open;
+        return !$open && self::freeRepeats($pattern) <= 1;
+    }
+
+    private static function literalAt($pattern, $i)
+    {
+        if (!isset($pattern[$i])) {
+            return null;
+        }
+        $char = $pattern[$i];
+        if ($char === '\\') {
+            return isset($pattern[$i + 1]) && !preg_match('/[a-z0-9]/i', $pattern[$i + 1]) ? $pattern[$i + 1] : null;
+        }
+        return strpos('.[](){}*+?|^$', $char) !== false ? null : $char;
+    }
+
+    // Two repeats that can both take the same text multiply each other's work:
+    // ".*=.*=.*x" against a query of "=" that never ends in "x" is polynomial,
+    // and MAX_TEXT is plenty for that to hang a request. A repeat is pinned
+    // when the character straight after it is one it can't match ("[^/]+/"
+    // ends at the first "/", once); any other is free, and a pattern may hold
+    // one free repeat.
+    private static function freeRepeats($pattern)
+    {
+        $free = 0;
+        $length = strlen($pattern);
+        for ($i = 0; $i < $length;) {
+            $start = $i;
+            $char = $pattern[$i];
+            if ($char === '\\') {
+                $i += 2;
+            } elseif ($char === '[') {
+                $i++;
+                while ($i < $length && $pattern[$i] !== ']') {
+                    $i += $pattern[$i] === '\\' ? 2 : 1;
+                }
+                $i++;
+            } elseif ($char === '(') {
+                $i += isset($pattern[$i + 1]) && $pattern[$i + 1] === '?' ? 3 : 1;
+                continue;
+            } elseif ($char === '|' || $char === '^' || $char === '$') {
+                $i++;
+                continue;
+            } else {
+                $i++;
+            }
+            // A group's text can't be tried against one character.
+            $atom = $char === ')' ? null : substr($pattern, $start, $i - $start);
+            $quantifier = isset($pattern[$i]) ? $pattern[$i] : '';
+            $repeats = $quantifier === '*' || $quantifier === '+';
+            if ($quantifier === '{') {
+                if (!preg_match('/^\{(\d*)(,(\d*))?\}/', substr($pattern, $i), $bounds)) {
+                    continue;
+                }
+                // "{3}" is one length, not a choice; "{2,}" and "{2,9}" are choices.
+                $repeats = isset($bounds[2]) && $bounds[2] !== '' && (isset($bounds[3]) ? $bounds[3] : '') !== $bounds[1];
+                $i += strlen($bounds[0]) - 1;
+            } elseif ($quantifier !== '?' && !$repeats) {
+                continue;
+            }
+            $i++;
+            if (isset($pattern[$i]) && $pattern[$i] === '?') {
+                $i++;
+            }
+            if (!$repeats) {
+                continue;
+            }
+            $next = self::literalAt($pattern, $i);
+            // Not an atom on its own (preg_match fails): free.
+            if ($atom === null || $next === null || @preg_match(self::DELIM . '^(?:' . $atom . ')$' . self::DELIM . 'i', $next) !== 0) {
+                $free++;
+            }
+        }
+        return $free;
     }
 
     private static function section($section)
@@ -209,7 +292,8 @@ class RequestRules
         $rawQuery = strtolower(substr($mark === false ? '' : substr($target, $mark + 1), 0, self::MAX_TEXT));
         $ua = strtolower(substr((string) $userAgent, 0, self::MAX_TEXT));
         $decodedPath = self::normalizePath(substr(self::decodeOnce(substr($mark === false ? $target : substr($target, 0, $mark), 0, self::MAX_TEXT)), 0, self::MAX_TEXT));
-        $decodedQuery = substr(self::decodeOnce($rawQuery), 0, self::MAX_TEXT);
+        // Lowered again after decoding: %55NION is UNION, and the patterns are lower case.
+        $decodedQuery = strtolower(substr(self::decodeOnce($rawQuery), 0, self::MAX_TEXT));
         $upper = strtoupper((string) $method);
         foreach ($rules as $rule) {
             if ($rule['methods'] && !in_array($upper, $rule['methods'], true)) {

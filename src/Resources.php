@@ -528,64 +528,29 @@ class Resources
 
     private function spool(array $row)
     {
-        $file = $this->core->dir() . '/resources.jsonl';
-        clearstatcache(true, $file);
-        if (is_file($file) && filesize($file) > self::SPOOL_MAX) {
-            return;
-        }
-        @file_put_contents($file, json_encode($row) . "\n", FILE_APPEND | LOCK_EX);
+        $this->core->append('resources', $row, self::SPOOL_MAX);
     }
 
-    private function sendDue()
-    {
-        $mark = $this->core->dir() . '/resources.lock';
-        clearstatcache(true, $mark);
-        return !is_file($mark) || filemtime($mark) <= time() - self::SEND_EVERY;
-    }
-
-    // Sends the spooled samples. Rows are put back only when the collector
-    // couldn't take them and retrying may work.
+    // Sends the spooled samples, every SEND_EVERY seconds.
     private function send($force = false)
     {
-        $file = $this->core->dir() . '/resources.jsonl';
-        clearstatcache(true, $file);
-        if (!is_file($file) || (!$force && !$this->sendDue())) {
-            return;
-        }
-        $lock = @fopen($this->core->dir() . '/resources.lock', 'c');
-        if (!$lock || !flock($lock, LOCK_EX | LOCK_NB)) {
-            return;
-        }
-        @touch($this->core->dir() . '/resources.lock');
-        $sending = $file . '.' . getmypid() . '.sending';
-        if (@rename($file, $sending)) {
+        $this->core->drain('resources', self::SEND_EVERY, $force, function (array $samples) {
             $rows = array();
-            foreach (file($sending, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: array() as $line) {
-                $row = json_decode($line, true);
-                if (is_array($row) && isset($row['minute'])) {
+            foreach ($samples as $row) {
+                if (isset($row['minute'])) {
                     $rows[$row['minute']] = $row;
                 }
             }
             ksort($rows);
             $rows = array_slice(array_values($rows), -self::MAX_ROWS);
             if ($rows) {
-                $res = $this->core->http('POST', '/events/resources', array(
+                $this->core->post('resources', '/events/resources', array(
                     'site_id' => (string) $this->core->opt('site_id'),
                     'server_name' => substr((string) $this->options['server_name'], 0, 100),
                     'runtime' => 'PHP ' . PHP_VERSION,
                     'rows' => $rows,
-                ), array(), 'bearer');
-                // Unreachable or storage down: these samples are still good.
-                // A 4xx means resending won't make them acceptable.
-                if ($res['status'] === 0 || $res['status'] >= 500) {
-                    foreach ($rows as $row) {
-                        $this->spool($row);
-                    }
-                }
+                ), 'bearer');
             }
-            @unlink($sending);
-        }
-        flock($lock, LOCK_UN);
-        fclose($lock);
+        });
     }
 }

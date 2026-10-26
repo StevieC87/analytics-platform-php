@@ -67,27 +67,29 @@ class Performance
         $status = $status ?: 200;
         $route = $this->route !== '' ? $this->route
             : ($status === 404 ? self::NOT_FOUND : self::normalizeRoute(isset($_SERVER['REQUEST_URI']) ? $_SERVER['REQUEST_URI'] : '/'));
-        $file = $this->core->dir() . '/requests.jsonl';
-        clearstatcache(true, $file);
-        if (is_file($file) && filesize($file) > self::SPOOL_MAX) {
-            return;
-        }
-        $line = json_encode(array(
+        $this->core->append('requests', array(
             't' => time(),
             'm' => substr(strtoupper(isset($_SERVER['REQUEST_METHOD']) ? $_SERVER['REQUEST_METHOD'] : 'GET'), 0, 10),
             'r' => $route,
             's' => $status,
             'd' => round((microtime(true) - $started) * 1000, 1),
-        ));
-        @file_put_contents($file, $line . "\n", FILE_APPEND | LOCK_EX);
+        ), self::SPOOL_MAX);
         $this->route = '';
+    }
+
+    // A background job's run (Platform::job), timed like a request.
+    public function recordJob($route, $status, $ms)
+    {
+        if (!$this->core->isOn('performance') || !$this->core->ensureDir()) {
+            return;
+        }
+        $this->core->append('requests', array('t' => time(), 'm' => 'JOB', 'r' => substr((string) $route, 0, 200),
+            's' => (int) $status, 'd' => round((float) $ms, 1)), self::SPOOL_MAX);
     }
 
     public function due()
     {
-        $mark = $this->core->dir() . '/requests.lock';
-        clearstatcache(true, $mark);
-        return is_file($this->core->dir() . '/requests.jsonl') && (!is_file($mark) || filemtime($mark) <= time() - self::FLUSH_EVERY);
+        return $this->core->waiting('requests') && $this->core->sendDue('requests', self::FLUSH_EVERY);
     }
 
     private static function bucketOf($ms)
@@ -103,32 +105,22 @@ class Performance
     // Adds up the recorded requests and sends them, once a minute.
     public function flush($force = false)
     {
-        if (!$force && !$this->due()) {
-            return;
-        }
-        $file = $this->core->dir() . '/requests.jsonl';
-        $lock = @fopen($this->core->dir() . '/requests.lock', 'c');
-        if (!$lock || !flock($lock, LOCK_EX | LOCK_NB)) {
-            return;
-        }
-        @touch($this->core->dir() . '/requests.lock');
-        $sending = $file . '.' . getmypid() . '.sending';
-        if (@rename($file, $sending)) {
+        $this->core->drain('requests', self::FLUSH_EVERY, $force, function (array $recorded) {
             $rows = array();
-            foreach (file($sending, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: array() as $line) {
-                $r = json_decode($line, true);
-                if (!is_array($r) || !isset($r['t'], $r['m'], $r['r'], $r['s'], $r['d'])) {
+            foreach ($recorded as $r) {
+                if (!isset($r['t'], $r['m'], $r['r'], $r['s'], $r['d'])) {
                     continue;
                 }
                 $minute = (int) (floor($r['t'] / 60) * 60);
-                $key = $minute . '|' . $r['m'] . '|' . $r['r'] . '|' . $r['s'];
+                $route = (string) $r['r'];
+                $key = json_encode(array($minute, $r['m'], $route, $r['s']));
                 if (!isset($rows[$key]) && count($rows) >= self::MAX_KEYS) {
-                    $key = $minute . '|' . $r['m'] . '|(other)|' . $r['s'];
+                    $route = '(other)';
+                    $key = json_encode(array($minute, $r['m'], $route, $r['s']));
                 }
                 if (!isset($rows[$key])) {
-                    $parts = explode('|', $key, 4);
                     $rows[$key] = array(
-                        'minute' => gmdate('Y-m-d\TH:i:s\Z', $minute), 'method' => $r['m'], 'route' => $parts[2], 'status' => (int) $r['s'],
+                        'minute' => gmdate('Y-m-d\TH:i:s\Z', $minute), 'method' => $r['m'], 'route' => $route, 'status' => (int) $r['s'],
                         'count' => 0, 'sum_ms' => 0.0, 'max_ms' => 0.0, 'buckets' => array_fill(0, count(self::BUCKET_EDGES_MS) + 1, 0),
                     );
                 }
@@ -138,16 +130,13 @@ class Performance
                 $rows[$key]['max_ms'] = max($rows[$key]['max_ms'], $ms);
                 $rows[$key]['buckets'][self::bucketOf($ms)]++;
             }
-            @unlink($sending);
             foreach (array_chunk(array_values($rows), self::MAX_ROWS) as $batch) {
-                $this->core->http('POST', '/events/server-requests', array(
+                $this->core->post('requests', '/events/server-requests', array(
                     'server_name' => substr((string) $this->options['server_name'], 0, 100),
                     'runtime' => 'PHP ' . PHP_VERSION,
                     'rows' => $batch,
-                ), array(), 'body');
+                ));
             }
-        }
-        flock($lock, LOCK_UN);
-        fclose($lock);
+        });
     }
 }

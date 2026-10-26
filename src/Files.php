@@ -54,22 +54,25 @@ class Files
         );
     }
 
-    private static function clean($path)
+    // Shared with Posture, which walks folders the same way.
+    public static function clean($path)
     {
-        return rtrim(str_replace('\\', '/', $path), '/');
+        return rtrim(str_replace('\\', '/', (string) $path), '/');
     }
 
-    public function roots()
+    // The folders of $given that exist, resolved, without any inside another
+    // one on the list: those are already covered, and every file under them
+    // would be reported twice.
+    public static function realRoots(array $given)
     {
         $roots = array();
-        foreach ((array) $this->options['roots'] as $root) {
-            $real = realpath((string) $root);
+        foreach ($given as $root) {
+            $real = @realpath((string) $root);
             if ($real && is_dir($real)) {
-                $roots[] = self::clean($real);
+                $roots[$real] = self::clean($real);
             }
         }
-        // A root inside another is already covered.
-        $roots = array_unique($roots);
+        $roots = array_values($roots);
         return array_values(array_filter($roots, function ($root) use ($roots) {
             foreach ($roots as $other) {
                 if ($other !== $root && strpos($root . '/', $other . '/') === 0) {
@@ -78,6 +81,17 @@ class Files
             }
             return true;
         }));
+    }
+
+    public function roots()
+    {
+        return self::realRoots((array) $this->options['roots']);
+    }
+
+    // JSON needs UTF-8: a name that isn't is still reported, its bad bytes replaced.
+    public static function utf8($path)
+    {
+        return preg_match('//u', $path) ? $path : (function_exists('mb_convert_encoding') ? mb_convert_encoding($path, 'UTF-8', 'UTF-8') : rawurlencode($path));
     }
 
     // ---- State ----------------------------------------------------------------
@@ -92,7 +106,12 @@ class Files
             $saved = call_user_func($this->options['load']);
         } elseif ($this->core->ensureDir()) {
             $raw = @file_get_contents($this->core->dir() . '/files.json');
-            $saved = $raw ? json_decode($raw, true) : null;
+            if (is_string($raw) && strncmp($raw, 'ps:', 3) === 0) {
+                $saved = @unserialize(substr($raw, 3), array('allowed_classes' => false));
+            } else {
+                // As it was written before: JSON.
+                $saved = $raw ? json_decode($raw, true) : null;
+            }
         }
         $this->state = (is_array($saved) ? $saved : array()) + array('baseline' => null, 'last' => array(), 'full_at' => 0, 'next_at' => 0);
         return $this->state;
@@ -107,9 +126,13 @@ class Files
         if (!$this->core->ensureDir()) {
             return;
         }
+        // Serialized, not JSON: the paths are kept byte for byte, so one file
+        // name that isn't UTF-8 can't make the encoding fail and wipe the
+        // accepted version (JSON would refuse it, or replace its bad bytes and
+        // name a file that isn't there).
         $file = $this->core->dir() . '/files.json';
         $tmp = $file . '.' . getmypid() . '.tmp';
-        if (@file_put_contents($tmp, json_encode($this->state), LOCK_EX) === false || !@rename($tmp, $file)) {
+        if (@file_put_contents($tmp, 'ps:' . serialize($this->state), LOCK_EX) === false || !@rename($tmp, $file)) {
             @unlink($tmp);
         }
     }
@@ -128,8 +151,10 @@ class Files
     }
 
     // array(path => array(sha256, size, mtime)), truncated. A file whose size
-    // and time are unchanged keeps its last hash unless $full.
-    private function scan(array $previous, $full)
+    // and time are unchanged keeps its last hash unless $full. A file we
+    // already knew is never dropped for being unreadable or too big: it is
+    // still there, and reporting it deleted would hide what happened to it.
+    private function scan(array $previous, array $known, $full)
     {
         $current = array();
         $truncated = false;
@@ -161,17 +186,24 @@ class Files
                 if (!$this->watched($item->getFilename())) {
                     continue;
                 }
-                $size = @$item->getSize();
-                if ($size === false || $size > self::MAX_FILE_BYTES) {
+                $path = self::clean($item->getPathname());
+                $old = isset($previous[$path]) ? $previous[$path] : (isset($known[$path]) ? $known[$path] : null);
+                // A file deleted mid-walk fails its stat with an exception, not false.
+                try {
+                    $size = $item->getSize();
+                    $mtime = (int) $item->getMTime();
+                } catch (\RuntimeException $e) {
+                    continue;
+                }
+                // New files past the limit are left out (the protocol's 5 MB);
+                // one we knew that grew past it is a change, and still hashed.
+                if ($size > self::MAX_FILE_BYTES && !$old) {
                     continue;
                 }
                 if (count($current) >= self::MAX_FILES) {
                     $truncated = true;
                     break 2;
                 }
-                $path = self::clean($item->getPathname());
-                $mtime = (int) @$item->getMTime();
-                $old = isset($previous[$path]) ? $previous[$path] : null;
                 if ($old && !$full && (int) $old[1] === (int) $size && (int) $old[2] === $mtime) {
                     $current[$path] = $old;
                     continue;
@@ -179,6 +211,8 @@ class Files
                 $hash = @hash_file('sha256', $item->getPathname());
                 if ($hash !== false) {
                     $current[$path] = array($hash, (int) $size, $mtime);
+                } elseif ($old) {
+                    $current[$path] = $old;
                 }
             }
         }
@@ -228,12 +262,6 @@ class Files
         return gmdate('Y-m-d\TH:i:s\Z', (int) $time);
     }
 
-    // JSON needs UTF-8: a name that isn't is still reported, its bad bytes replaced.
-    private static function utf8($path)
-    {
-        return preg_match('//u', $path) ? $path : (function_exists('mb_convert_encoding') ? mb_convert_encoding($path, 'UTF-8', 'UTF-8') : utf8_encode($path));
-    }
-
     // Scans, reports and takes in what the owner accepted. $accept: the files
     // as they are now become the accepted version (after a deploy). Returns
     // the changes reported.
@@ -246,7 +274,11 @@ class Files
         $state = $this->load();
         $now = time();
         $full = $now - (int) $state['full_at'] >= self::FULL_HASH_EVERY;
-        list($current, $truncated) = $this->scan(is_array($state['last']) ? $state['last'] : array(), $full);
+        list($current, $truncated) = $this->scan(
+            is_array($state['last']) ? $state['last'] : array(),
+            is_array($state['baseline']) ? $state['baseline'] : array(),
+            $full
+        );
         if ($full) {
             $state['full_at'] = $now;
         }
@@ -297,7 +329,10 @@ class Files
             }
             $changes[] = $change;
         }
-        foreach (array_keys($state['baseline']) as $path) {
+        // A scan cut short at MAX_FILES didn't reach every file, and which ones
+        // it missed depends on the walk: those aren't gone, so nothing is
+        // reported deleted from it.
+        foreach ($truncated ? array() : array_keys($state['baseline']) as $path) {
             if (!isset($current[$path])) {
                 if ($this->trusted($path)) {
                     unset($state['baseline'][$path]);
@@ -327,7 +362,8 @@ class Files
             $answer = is_array($answer) ? $answer : array();
             $every = max(300, isset($answer['every']) ? (int) $answer['every'] : self::EVERY);
             if (!empty($answer['accept_all'])) {
-                $state['baseline'] = $current;
+                // Cut short, the files this scan missed stay accepted as they were.
+                $state['baseline'] = $truncated ? $current + $state['baseline'] : $current;
             }
             foreach (isset($answer['accept']) && is_array($answer['accept']) ? $answer['accept'] : array() as $item) {
                 $path = isset($item['path']) ? (string) $item['path'] : '';

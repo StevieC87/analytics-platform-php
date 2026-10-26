@@ -28,7 +28,7 @@ class Proxy
 {
     // The tracker files, by name: anything else is refused, not forwarded.
     const FILES = array('track.js', 's.js', 'snapshot.js', 'replay.js', 'survey.js', 'banner.js',
-        'leadform.js', 'notice.js', 'editor.js', 'picker.js', 'feedback.js', 'shield.js');
+        'leadform.js', 'notice.js', 'editor.js', 'picker.js', 'feedback.js', 'shield.js', 'widget.js', 'share.js');
     // A pinned version never changes; /v<major>/ follows new releases, so it
     // is held for an hour, the same as the collector serves it with.
     const TTL_PINNED = 604800;

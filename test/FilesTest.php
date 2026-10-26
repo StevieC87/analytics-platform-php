@@ -47,7 +47,7 @@ $files = new Files($core, array('roots' => array($site)));
 // scan() is private: this is the walk itself, without the reporting around it.
 $scan = new ReflectionMethod($files, 'scan');
 $scan->setAccessible(true);
-list($current, $truncated) = $scan->invoke($files, array(), true);
+list($current, $truncated) = $scan->invoke($files, array(), array(), true);
 
 check('a watched file is hashed', isset($current[$config]) && isset($current[$shell]));
 check('a script is watched too', isset($current[$site . '/fine.js']));
@@ -75,8 +75,35 @@ check('there is a cap on how many files get read', Files::MAX_SIGNAL_FILES > 0 &
 $excluded = new Files($core, array('roots' => array($site), 'exclude' => array($site . '/uploads')));
 $scan2 = new ReflectionMethod($excluded, 'scan');
 $scan2->setAccessible(true);
-list($some) = $scan2->invoke($excluded, array(), true);
+list($some) = $scan2->invoke($excluded, array(), array(), true);
 check('an excluded folder is skipped', !isset($some[$inUploads]) && isset($some[$config]));
+
+// Past 5 MB a new file is left out, but one already accepted that grew past
+// it (a backdoor padded with junk) is still hashed, so it shows as modified,
+// not as deleted.
+$big = $write('padded.php', '<?php eval(base64_decode("x")); ' . str_repeat(' ', Files::MAX_FILE_BYTES));
+list($unknown) = $scan->invoke($files, array(), array(), true);
+check('a new file past the limit is left out', !isset($unknown[$big]));
+list($known) = $scan->invoke($files, array(), array($big => array(str_repeat('0', 64), 10, 0)), true);
+check('a known file that grew past the limit is still hashed', isset($known[$big]) && $known[$big][0] !== str_repeat('0', 64));
+@unlink($big);
+
+// The state survives a file name that isn't UTF-8, byte for byte.
+$latin = $write("caf\xe9.php", '<?php echo 1;');
+// run() reports to the collector: answered here, without the network.
+$offline = new class (array('site_id' => 'a1b2c3d4e5f6a1b2c3d4e5f6', 'secret' => 's', 'endpoint' => 'https://c.example', 'storage' => $store)) extends Core {
+    public function http($method, $path, $body = null, array $headers = array(), $auth = 'bearer')
+    {
+        return array('status' => 0, 'body' => '', 'headers' => array());
+    }
+};
+(new Files($offline, array('roots' => array($site))))->run(true);
+$reloaded = new Files($offline, array('roots' => array($site)));
+$load = new ReflectionMethod($reloaded, 'load');
+$load->setAccessible(true);
+$state = $load->invoke($reloaded);
+check('a non-UTF-8 name does not wipe the accepted version', is_array($state['baseline']) && isset($state['baseline'][$latin]));
+@unlink($latin);
 
 foreach (array($site . '/uploads/shell.php', $site . '/sneaky.php', $config, $shell, $site . '/fine.js', $site . '/logo.png') as $path) {
     @unlink($path);

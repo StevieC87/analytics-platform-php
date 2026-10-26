@@ -1,6 +1,6 @@
 <?php
 // Feature flags and maintenance mode: both come with the module switches
-// (Core), set in Security → Settings → Server package.
+// (Core), set in Security → Server package.
 // - Flags: on or off for everyone, a share of users (a hash of "key:user",
 //   the same in the Node and Python packages), or listed user IDs.
 // - Maintenance: a "back soon" page (503) for everyone but the allowed

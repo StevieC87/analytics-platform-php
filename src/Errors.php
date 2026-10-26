@@ -3,8 +3,10 @@
 // /events/server-errors), where they join the browser's errors in the Errors
 // report. install() catches uncaught exceptions (the handler that was there
 // still runs); onShutdown() reads a fatal error (Platform calls it at
-// shutdown); captureException() sends errors you catch. Errors wait in
-// memory and are sent after the response (Platform::afterResponse).
+// shutdown); captureException() sends errors you catch. An error is sent
+// once however many of those see it. Errors wait in memory and are sent after
+// the response (Platform::afterResponse); a batch the collector couldn't take
+// waits on disk and is sent again by a later request.
 
 namespace AnalyticsPlatform;
 
@@ -13,6 +15,8 @@ class Errors
     const BATCH = 10;
     const QUEUE_MAX = 50;
     const FATAL = 85; // E_ERROR | E_PARSE | E_CORE_ERROR | E_COMPILE_ERROR
+    // Seconds between tries at the batches the collector couldn't take.
+    const RESEND_EVERY = 60;
 
     private $core;
     private $options;
@@ -20,6 +24,14 @@ class Errors
     private $previous = null;
     private $installed = false;
     private $fatalRead = false;
+    // Errors captured since the last send, each with its key in the queue
+    // (null when it was dropped): Laravel reporting one and then logging it
+    // would otherwise send it twice. Emptied on flush(), so a long-running
+    // worker (Octane, queue:work) doesn't keep every exception it ever saw.
+    private $seen;
+    private $route = '';
+    // The background job running (Platform::job), whose name is the route.
+    private $job = '';
 
     // Options: server_name (default the host name), root (paths are made
     // relative to it; default the document root's parent), release (which build
@@ -29,6 +41,7 @@ class Errors
     public function __construct(Core $core, array $options = array())
     {
         $this->core = $core;
+        $this->seen = new \SplObjectStorage();
         $root = isset($_SERVER['DOCUMENT_ROOT']) && $_SERVER['DOCUMENT_ROOT'] !== '' ? dirname($_SERVER['DOCUMENT_ROOT']) : getcwd();
         $this->options = $options + array(
             'server_name' => function_exists('gethostname') ? gethostname() : '',
@@ -110,12 +123,27 @@ class Errors
         return "Traceback (most recent call last):\n" . implode("\n", $lines) . "\n" . get_class($error) . ': ' . $error->getMessage();
     }
 
+    // The request's route pattern, as Server speed names it (Platform::setRoute).
+    public function setRoute($route)
+    {
+        $this->route = substr((string) $route, 0, 200);
+    }
+
+    public function setJob($route)
+    {
+        $this->job = (string) $route;
+    }
+
     public function requestFields()
     {
+        if ($this->job !== '') {
+            return array('method' => 'JOB', 'path' => $this->job, 'route' => $this->job, 'session_id' => '');
+        }
         $path = isset($_SERVER['REQUEST_URI']) ? $_SERVER['REQUEST_URI'] : '';
         return array(
             'method' => isset($_SERVER['REQUEST_METHOD']) ? (string) $_SERVER['REQUEST_METHOD'] : '',
             'path' => explode('?', (string) $path, 2)[0],
+            'route' => $this->route,
             'session_id' => Platform::sessionIdFromRequest(),
         );
     }
@@ -128,6 +156,11 @@ class Errors
         }
         try {
             $isError = $error instanceof \Throwable;
+            $request = $request === null ? $this->requestFields() : $request;
+            if ($isError && $this->seen->contains($error)) {
+                $this->upgrade($error, $request, $status, $kind);
+                return;
+            }
             $event = array(
                 'message' => $isError ? ($error->getMessage() !== '' ? $error->getMessage() : get_class($error)) : (string) $error,
                 'error_type' => $isError ? (new \ReflectionClass($error))->getShortName() : 'Error',
@@ -135,17 +168,55 @@ class Errors
                 'kind' => $kind,
                 'status_code' => (int) $status,
             );
-            foreach (($request === null ? $this->requestFields() : $request) as $key => $value) {
+            foreach ($request as $key => $value) {
                 if (in_array($key, array('method', 'path', 'route', 'session_id'), true)) {
                     $event[$key] = (string) $value;
                 }
             }
-            $this->add($event, $error);
+            // Named as Server speed names the request, so the two match.
+            if (empty($event['route']) && !empty($event['path'])) {
+                $event['route'] = Performance::normalizeRoute($event['path']);
+            }
+            $key = $this->add($event, $error);
+            if ($isError) {
+                $this->seen[$error] = $key;
+            }
         } catch (\Throwable $failure) {
             // never break the site
         }
     }
 
+    // An exception logged and then thrown on is captured first as "logged",
+    // with no status; Laravel's report that follows knows the status and kind.
+    private function upgrade($error, array $request, $status, $kind)
+    {
+        $key = $this->seen[$error];
+        if ($kind === 'logged' || $key === null || !isset($this->queue[$key])) {
+            return;
+        }
+        $event = $this->queue[$key];
+        if ($event['kind'] === 'logged') {
+            $event['kind'] = $kind;
+        }
+        if (empty($event['status_code'])) {
+            $event['status_code'] = (int) $status;
+        }
+        foreach (array('method', 'path', 'route', 'session_id') as $field) {
+            if (empty($event[$field]) && !empty($request[$field])) {
+                $event[$field] = (string) $request[$field];
+            }
+        }
+        if (is_callable($this->options['before_send'])) {
+            $event = call_user_func($this->options['before_send'], $event, $error);
+        }
+        if ($event) {
+            $this->queue[$key] = $event;
+        } else {
+            unset($this->queue[$key]);
+        }
+    }
+
+    // Queues an event; returns its key in the queue, or null when it was dropped.
     private function add(array $event, $error)
     {
         $event += array(
@@ -154,16 +225,21 @@ class Errors
             'os' => PHP_OS_FAMILY,
             'server_name' => substr((string) $this->options['server_name'], 0, 100),
             'release' => substr(preg_replace('/[^\w.+-]/', '', (string) $this->options['release']), 0, 64),
+            // When it happened: an error resent by a later request keeps its own time.
+            'at' => gmdate('Y-m-d\TH:i:s\Z'),
         );
         if (is_callable($this->options['before_send'])) {
             $event = call_user_func($this->options['before_send'], $event, $error);
             if (!$event) {
-                return;
+                return null;
             }
         }
-        if (count($this->queue) < self::QUEUE_MAX) {
-            $this->queue[] = $event;
+        if (count($this->queue) >= self::QUEUE_MAX) {
+            return null;
         }
+        $this->queue[] = $event;
+        end($this->queue);
+        return key($this->queue);
     }
 
     public function pending()
@@ -171,12 +247,22 @@ class Errors
         return count($this->queue) > 0;
     }
 
+    // Batches an earlier request couldn't send are waiting, and it's time to try them.
+    public function due()
+    {
+        return $this->core->waiting('errors') && $this->core->sendDue('errors', self::RESEND_EVERY);
+    }
+
     public function flush()
     {
-        $waiting = $this->queue;
+        $waiting = array_values($this->queue);
         $this->queue = array();
+        $this->seen = new \SplObjectStorage();
         foreach (array_chunk($waiting, self::BATCH) as $batch) {
-            $this->core->http('POST', '/events/server-errors', array('errors' => $batch), array(), 'body');
+            $this->core->post('errors', '/events/server-errors', array('errors' => $batch));
         }
+        // The errors spool holds only those retries, so there's nothing else to drain.
+        $this->core->drain('errors', self::RESEND_EVERY, false, function () {
+        });
     }
 }

@@ -150,15 +150,10 @@ class Crawlers
         if ($bot === '') {
             return; // A visitor: the tracker counts those.
         }
-        $file = $this->core->dir() . '/crawlers.jsonl';
-        clearstatcache(true, $file);
-        if (is_file($file) && filesize($file) > self::SPOOL_MAX) {
-            return;
-        }
         $started = isset($_SERVER['REQUEST_TIME_FLOAT']) ? (float) $_SERVER['REQUEST_TIME_FLOAT'] : microtime(true);
         $status = (int) http_response_code();
         $path = explode('#', explode('?', isset($_SERVER['REQUEST_URI']) ? $_SERVER['REQUEST_URI'] : '/', 2)[0], 2)[0];
-        $line = json_encode(array(
+        $this->core->append('crawlers', array(
             't' => time(),
             'b' => $bot,
             'p' => substr($path === '' ? '/' : $path, 0, self::MAX_PATH),
@@ -166,48 +161,35 @@ class Crawlers
             'd' => (int) round((microtime(true) - $started) * 1000),
             'z' => self::bytesSent(),
             'i' => (string) $ip,
-        ));
-        @file_put_contents($file, $line . "\n", FILE_APPEND | LOCK_EX);
+        ), self::SPOOL_MAX);
     }
 
     public function due()
     {
-        $mark = $this->core->dir() . '/crawlers.lock';
-        clearstatcache(true, $mark);
-        return is_file($this->core->dir() . '/crawlers.jsonl') && (!is_file($mark) || filemtime($mark) <= time() - self::FLUSH_EVERY);
+        return $this->core->waiting('crawlers') && $this->core->sendDue('crawlers', self::FLUSH_EVERY);
     }
 
     // Adds up the recorded requests and sends them, once a minute.
     public function flush($force = false)
     {
-        if (!$force && !$this->due()) {
-            return;
-        }
-        $file = $this->core->dir() . '/crawlers.jsonl';
-        $lock = @fopen($this->core->dir() . '/crawlers.lock', 'c');
-        if (!$lock || !flock($lock, LOCK_EX | LOCK_NB)) {
-            return;
-        }
-        @touch($this->core->dir() . '/crawlers.lock');
-        $sending = $file . '.' . getmypid() . '.sending';
-        if (@rename($file, $sending)) {
+        $this->core->drain('crawlers', self::FLUSH_EVERY, $force, function (array $recorded) {
             $rows = array();
             $agents = array();
-            foreach (file($sending, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: array() as $line) {
-                $r = json_decode($line, true);
-                if (!is_array($r) || !isset($r['t'], $r['b'], $r['p'], $r['s'])) {
+            foreach ($recorded as $r) {
+                if (!isset($r['t'], $r['b'], $r['p'], $r['s'])) {
                     continue;
                 }
                 $minute = (int) (floor($r['t'] / 60) * 60);
-                $key = $minute . '|' . $r['b'] . '|' . $r['p'] . '|' . $r['s'];
+                $path = (string) $r['p'];
+                $key = json_encode(array($minute, $r['b'], $path, $r['s']));
                 // Past MAX_KEYS a crawler asking for thousands of URLs becomes one row.
                 if (!isset($rows[$key]) && count($rows) >= self::MAX_KEYS) {
-                    $key = $minute . '|' . $r['b'] . '|(other)|' . $r['s'];
+                    $path = '(other)';
+                    $key = json_encode(array($minute, $r['b'], $path, $r['s']));
                 }
                 if (!isset($rows[$key])) {
-                    $parts = explode('|', $key, 4);
                     $rows[$key] = array(
-                        'minute' => gmdate('Y-m-d\TH:i:s\Z', $minute), 'bot' => $r['b'], 'path' => $parts[2],
+                        'minute' => gmdate('Y-m-d\TH:i:s\Z', $minute), 'bot' => $r['b'], 'path' => $path,
                         'status' => (int) $r['s'], 'count' => 0, 'bytes' => 0, 'sum_ms' => 0,
                     );
                 }
@@ -225,21 +207,18 @@ class Crawlers
                     }
                 }
             }
-            @unlink($sending);
             $list = array();
             foreach ($agents as $bot => $ips) {
                 $list[] = array('bot' => $bot, 'ips' => $ips);
             }
             foreach (array_chunk(array_values($rows), self::MAX_ROWS) as $i => $batch) {
-                $this->core->http('POST', '/events/crawlers', array(
+                $this->core->post('crawlers', '/events/crawlers', array(
                     'server_name' => substr((string) $this->options['server_name'], 0, 100),
                     'runtime' => 'PHP ' . PHP_VERSION,
                     'rows' => $batch,
                     'agents' => $i === 0 ? $list : array(),
-                ), array(), 'body');
+                ));
             }
-        }
-        flock($lock, LOCK_UN);
-        fclose($lock);
+        });
     }
 }

@@ -8,14 +8,18 @@ return [
     // Site settings in your dashboard. Keep it in .env, never in the browser.
     'secret' => env('ANALYTICS_SITE_SECRET'),
     'endpoint' => env('ANALYTICS_FIREWALL_ENDPOINT'),
+    // Names this service (web, worker…) on its errors and timings. Default: the host name.
+    'server_name' => env('ANALYTICS_SERVER_NAME'),
     // 'monitor' or 'block' overrides the dashboard; empty follows it.
     'mode' => env('ANALYTICS_FIREWALL_MODE'),
-    // Modules: each can also be switched off in the dashboard (Security → Settings → Server package).
+    // Modules: each can also be switched off in the dashboard (Security → Server package).
     // Serves the tracker and takes visits under your own domain, so ad
     // blockers can't hide those visitors (README: "Ad blockers").
     'proxy' => env('ANALYTICS_PROXY', true),
     'firewall' => env('ANALYTICS_FIREWALL', true),
     'errors' => env('ANALYTICS_ERRORS', true),
+    // Also send the exceptions your code logs (Log::error('...', ['exception' => $e])).
+    'capture_logs' => env('ANALYTICS_CAPTURE_LOGS', false),
     'analytics' => env('ANALYTICS_SERVER_EVENTS', true),
     'performance' => env('ANALYTICS_PERFORMANCE', true),
     // The Composer packages and PHP version, once a day, for the Security check.

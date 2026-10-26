@@ -15,7 +15,8 @@ $platform = new AnalyticsPlatform\Platform([
     'secret'   => getenv('ANALYTICS_SITE_SECRET'), // site settings; keep it on the server
     'endpoint' => 'https://YOUR_COLLECTOR_URL',
     // 'trust_proxy' => 1,            // behind Nginx or a load balancer
-    // 'trust_proxy' => 'cloudflare', // every request through Cloudflare
+    // 'trust_proxy' => 'cloudflare', // every request through Cloudflare (CF-Connecting-IP is
+    //                                // believed only from Cloudflare's own addresses)
     // 'storage' => '/var/cache/analytics-platform', // default: the system temp dir
 ]);
 $platform->protect(); // as early as possible, before any output
@@ -45,7 +46,7 @@ file and load it with `auto_prepend_file` in `php.ini` or `.user.ini`.
 | `files` | File monitoring: `'files' => ['roots' => [__DIR__ . '/public']]`, then `$platform->checkFiles()` from a cron job, hourly; `$platform->checkFiles(true, true)` after a deploy accepts the files as they are (protocol: `sdk/protocols/files.md`). Changed code, backdoors and defacement show in Security → Page integrity (WordPress: automatic, through WP-Cron) | off |
 
 Each takes `true`, `false` or its options (`'errors' => ['before_send' => ...]`).
-They can also be switched off in the dashboard (Security → Settings → Server package).
+They can also be switched off in the dashboard (Security → Server package).
 
 ## How it works
 
@@ -92,7 +93,21 @@ try {
 
 The visit is read from the `X-Analytics-Session` header (send
 `window.analyticsSession.getId()` with your requests) or the
-`analytics_session` cookie, which the WordPress plugin sets.
+`analytics_session` cookie, which the WordPress plugin sets. An error carries
+the route `setRoute()` named. One exception is sent once however often it is
+captured, and a batch the collector couldn't take is kept on disk and sent by
+a later request; each error keeps the time it happened.
+
+Background jobs (a worker, a cron script):
+
+```php
+$platform->job('send-receipts', function () { /* ... */ });
+```
+
+Their errors carry the job's name as the route, a job that throws is sent
+(status 500) and thrown on, each run is timed (Server speed → Jobs), and on
+the command line errors are sent after every job. Several services on one
+site: `'server_name' => 'worker'` in the options.
 
 ## Laravel
 
@@ -110,7 +125,10 @@ In your code: `app(AnalyticsPlatform\Platform::class)->track('purchase', [...])`
 The visitor's address is `$request->ip()`, so set up Laravel's trusted proxies
 if you're behind a load balancer or Cloudflare. The rate limit counts in your
 cache store (not the `array` driver). Modules: `ANALYTICS_FIREWALL`,
-`ANALYTICS_ERRORS`, `ANALYTICS_SERVER_EVENTS`, `ANALYTICS_INVENTORY` (`false` turns one off). To
+`ANALYTICS_ERRORS`, `ANALYTICS_SERVER_EVENTS`, `ANALYTICS_INVENTORY` (`false` turns one off).
+`ANALYTICS_CAPTURE_LOGS=true` also sends exceptions you log at error or above
+(`Log::error('...', ['exception' => $e])`). Queue jobs (`queue:work`) are
+wrapped as jobs on their own; `ANALYTICS_SERVER_NAME=worker` names the service. To
 protect only some routes, set `ANALYTICS_FIREWALL_GLOBAL=false` and add
 `AnalyticsPlatform\Laravel\FirewallMiddleware` to them.
 
@@ -146,7 +164,7 @@ $proxy = $platform->proxy();
   `px.php`, without loading WordPress at all. Settings → Site Analytics → Ad
   blockers says whether it's working.
 - Switch it off with `'proxy' => false` (Laravel: `ANALYTICS_PROXY=false`), or
-  in the dashboard (Security → Settings → Server package).
+  in the dashboard (Security → Server package).
 
 ## Other frameworks
 

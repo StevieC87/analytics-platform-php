@@ -1,6 +1,7 @@
 <?php
 // Checks each request with $request->ip(), so Laravel's trusted proxies
-// decide the visitor's address. Errors, events, rules and module switches
+// decide the visitor's address, for the firewall and for everything else the
+// platform does with it (maintenance allow list, forms, audit, crawlers). Errors, events, rules and module switches
 // are sent and synced after the response (terminate).
 
 namespace AnalyticsPlatform\Laravel;
@@ -10,6 +11,9 @@ use Closure;
 
 class FirewallMiddleware
 {
+    // Marks a request answered by the proxy, so terminate() leaves it alone.
+    const PROXIED = 'analytics-platform.proxied';
+
     private $platform;
 
     public function __construct(Platform $platform)
@@ -19,6 +23,7 @@ class FirewallMiddleware
 
     public function handle($request, Closure $next)
     {
+        $this->platform->setClientIp((string) $request->ip());
         // The tracker's own addresses, answered before anything else: a
         // visitor's beacon is our traffic, not a page of the site, so it
         // isn't timed, counted as a crawler or rate-limited.
@@ -31,6 +36,7 @@ class FirewallMiddleware
             (string) $request->ip()
         );
         if ($served !== null) {
+            $request->attributes->set(self::PROXIED, true);
             return response($served['body'], $served['status'], $served['headers']);
         }
         return $this->withHeaders($this->check($request, $next));
@@ -91,7 +97,9 @@ class FirewallMiddleware
 
     public function terminate($request, $response)
     {
-        if (!$this->platform->configured()) {
+        // A proxied beacon is our traffic, not the site's: it isn't timed.
+        if (!$this->platform->configured() || $request->attributes->get(self::PROXIED)) {
+            $this->platform->setClientIp(null);
             return;
         }
         // Server speed: Laravel's route pattern ("/orders/{order}") and the real status.
@@ -103,5 +111,7 @@ class FirewallMiddleware
             http_response_code($response->getStatusCode());
         }
         $this->platform->recordAndSend();
+        // A long-lived worker (Octane) serves the next visitor with this same Platform.
+        $this->platform->setClientIp(null);
     }
 }

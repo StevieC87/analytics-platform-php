@@ -2,7 +2,8 @@
 // Laravel: found by package discovery. Builds the platform (firewall, error
 // monitoring, server analytics) from config/analytics-firewall.php (the .env
 // keys there) and, unless 'global' is off, puts its middleware first in
-// every request. Errors Laravel reports go to the Errors report too. Rate
+// every request. Errors Laravel reports go to the Errors report too, and
+// with 'capture_logs' the exceptions your code logs. Rate
 // limits count in the app's cache store, so APCu isn't needed.
 //
 // In your code: app(AnalyticsPlatform\Platform::class)->track('purchase', [...]).
@@ -34,6 +35,7 @@ class FirewallServiceProvider extends ServiceProvider
                 'site_id' => $config['site_id'],
                 'secret' => $config['secret'],
                 'endpoint' => $config['endpoint'],
+                'server_name' => $config['server_name'] ?? null,
                 'storage' => storage_path('framework/analytics-firewall'),
                 'platform' => 'laravel',
                 'proxy' => (bool) ($config['proxy'] ?? true),
@@ -57,6 +59,7 @@ class FirewallServiceProvider extends ServiceProvider
     {
         $this->publishes(array(__DIR__ . '/config.php' => config_path('analytics-firewall.php')), 'analytics-firewall');
         if ($this->app->runningInConsole()) {
+            $this->queueJobs();
             return;
         }
         if ($this->app['config']->get('analytics-firewall.global')) {
@@ -86,19 +89,66 @@ class FirewallServiceProvider extends ServiceProvider
                 });
             }
         }
+        // A fatal error ends the request before the middleware's terminate():
+        // Laravel reports it from its own shutdown function, registered before
+        // this one, so by the time this runs it is waiting to be sent.
+        register_shutdown_function(function () {
+            $this->app->make(Platform::class)->sendErrors();
+        });
         // Errors Laravel reports (what it logs), from requests and elsewhere.
         $handler = $this->app->make(ExceptionHandler::class);
         if (method_exists($handler, 'reportable')) {
             $handler->reportable(function (\Throwable $error) {
-                $request = request();
-                $route = $request && $request->route() ? $request->route()->uri() : '';
-                $this->app->make(Platform::class)->captureException($error, array(
-                    'method' => $request ? $request->method() : '',
-                    'path' => $request ? '/' . ltrim($request->path(), '/') : '',
-                    'route' => $route ? '/' . ltrim($route, '/') : '',
-                    'session_id' => Platform::sessionIdFromRequest(),
-                ), 500, 'error');
+                $this->app->make(Platform::class)->captureException($error, $this->requestFields(), 500, 'error');
             });
         }
+        // Exceptions logged at error or above. One Laravel just reported is
+        // logged too, and isn't sent a second time.
+        if ($this->app['config']->get('analytics-firewall.capture_logs') && class_exists('Illuminate\\Log\\Events\\MessageLogged')) {
+            $this->app['events']->listen('Illuminate\\Log\\Events\\MessageLogged', function ($e) {
+                $error = isset($e->context['exception']) ? $e->context['exception'] : null;
+                if ($error instanceof \Throwable && in_array($e->level, array('error', 'critical', 'alert', 'emergency'), true)) {
+                    $this->app->make(Platform::class)->captureException($error, $this->requestFields(), 0, 'logged');
+                }
+            });
+        }
+    }
+
+    // Queue workers (queue:work): each job is timed and its errors sent with
+    // the job's name as their route, after every job, since a worker never
+    // reaches the end of a request.
+    private function queueJobs()
+    {
+        $config = $this->app['config'];
+        // Either one: with errors off, the jobs are still timed.
+        if (!($config->get('analytics-firewall.errors') || $config->get('analytics-firewall.performance', true))
+            || !class_exists('Illuminate\\Queue\\Events\\JobProcessing')) {
+            return;
+        }
+        $events = $this->app['events'];
+        $events->listen('Illuminate\\Queue\\Events\\JobProcessing', function ($e) {
+            $this->app->make(Platform::class)->startJob($e->job->resolveName());
+        });
+        $events->listen('Illuminate\\Queue\\Events\\JobProcessed', function () {
+            $this->app->make(Platform::class)->endJob(false);
+        });
+        $events->listen('Illuminate\\Queue\\Events\\JobExceptionOccurred', function ($e) {
+            $platform = $this->app->make(Platform::class);
+            $platform->captureException($e->exception, null, 500, 'error');
+            $platform->endJob(true);
+        });
+    }
+
+    // The request being handled, as the Errors report and Server speed name it.
+    private function requestFields()
+    {
+        $request = request();
+        $route = $request && $request->route() ? $request->route()->uri() : '';
+        return array(
+            'method' => $request ? $request->method() : '',
+            'path' => $request ? '/' . ltrim($request->path(), '/') : '',
+            'route' => $route ? '/' . ltrim($route, '/') : '',
+            'session_id' => Platform::sessionIdFromRequest(),
+        );
     }
 }

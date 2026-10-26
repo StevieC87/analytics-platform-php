@@ -39,6 +39,17 @@ foreach ($cases['requests'] as $request) {
     }
 }
 
+// The regex guard, against the same lists the backend and collector check.
+foreach (array('refused' => false, 'allowed' => true) as $list => $want) {
+    foreach (isset($cases['patterns'][$list]) ? $cases['patterns'][$list] : array() as $pattern) {
+        $checked++;
+        if (RequestRules::safePattern($pattern) !== $want) {
+            $failed++;
+            printf("FAIL safePattern(%s) should be %s\n", $pattern, $want ? 'allowed' : 'refused');
+        }
+    }
+}
+
 // The same edge cases the other packages check.
 $empty = RequestRules::compile(array('rules' => array(array('id' => 'empty', 'action' => 'block'))));
 $checked++;

@@ -6,8 +6,9 @@
 // fetch whatever they liked, so what this test covers is the gate. The
 // forwarding itself needs a collector and is checked by hand.
 //
-// px.php is run as the web server runs it, with the address in PATH_INFO and
-// a config of our own. The collector is pointed at a closed port, so an
+// px.php is run as the web server runs it, with the address in PATH_INFO
+// (prefix first, which is how it knows whose config to read) and a config of
+// our own. The collector is pointed at a closed port, so an
 // allowed address fails upstream at once and answers with nothing, while a
 // rejected one answers "Not found" without asking anybody.
 //
@@ -22,16 +23,17 @@ if ($px === false) {
     echo "SKIP: the WordPress plugin is not alongside this package, so px.php cannot be driven\n";
     exit(0);
 }
-// The second place px.php looks (sdk/cache/site-analytics/*/px-config.php),
+// The first place px.php looks (sdk/cache/site-analytics/px/<prefix>.php),
 // never the plugin folder: a leftover there would be shipped in the zip.
-$configDir = __DIR__ . '/../../cache/site-analytics/test';
+$configDir = __DIR__ . '/../../cache/site-analytics/px';
 $cacheDir = sys_get_temp_dir() . '/sa-proxy-test-' . getmypid();
 @mkdir($configDir, 0777, true);
 @mkdir($cacheDir, 0777, true);
 // The plugin works the path out from the secret and writes it here, because
 // the secret itself must never sit in a file the web server can serve.
 $prefix = AnalyticsPlatform\Proxy::prefixFor('s3cret');
-file_put_contents($configDir . '/px-config.php', "<?php\nreturn " . var_export(array(
+$configFile = $configDir . '/' . $prefix . '.php';
+file_put_contents($configFile, "<?php\nreturn " . var_export(array(
     'endpoint' => 'http://127.0.0.1:1', 'trust_proxy' => '0', 'dir' => $cacheDir, 'prefix' => $prefix,
 ), true) . ";\n");
 
@@ -47,10 +49,12 @@ function check($name, $ok)
     }
 }
 
-function run($px, $pathInfo, $method = 'GET')
+// $pathInfo is below the prefix; $raw sends it exactly as given instead.
+function run($px, $pathInfo, $method = 'GET', $raw = false)
 {
-    // Reached directly, so the rest of the address arrives as PATH_INFO;
-    // px.php puts the configured path in front of it itself.
+    // Reached directly, so the address arrives as PATH_INFO, prefix first.
+    global $prefix;
+    $pathInfo = $raw ? $pathInfo : '/' . $prefix . $pathInfo;
 
     $command = 'REQUEST_METHOD=' . escapeshellarg($method)
         . ' PATH_INFO=' . escapeshellarg($pathInfo)
@@ -76,6 +80,17 @@ foreach (array(
     check("rejects $name", $refused(run($px, $path)));
 }
 
+// The prefix picks the config, so it must be this site's and nothing else:
+// another site's (or an old secret's) has no config here, and it is part of a
+// file name, so nothing but eight hex digits gets that far.
+foreach (array(
+    '/js/v1/s.js' => 'no prefix at all',
+    '/' . AnalyticsPlatform\Proxy::prefixFor('other') . '/js/v1/s.js' => "another site's prefix",
+    '/../px/' . $prefix . '/js/v1/s.js' => 'a traversal in the prefix',
+) as $path => $name) {
+    check("rejects $name", $refused(run($px, $path, 'GET', true)));
+}
+
 // What is allowed gets as far as asking the collector, which isn't there.
 foreach (array('/js/v1/s.js', '/js/v1.2.3/track.js', '/js/v1/replay.js', '/api/e', '/api/proxy-check') as $path) {
     check("allows $path", !$refused(run($px, $path, $path === '/api/e' ? 'POST' : 'GET')));
@@ -91,7 +106,7 @@ foreach (array('PUT', 'DELETE') as $method) {
 file_put_contents($cacheDir . '/px-' . hash('sha256', 'v1/s.js') . '.js', str_repeat("// cached tracker\n", 60));
 check('falls back to the cached tracker', strpos(run($px, '/js/v1/s.js'), 'cached tracker') !== false);
 
-foreach (array($configDir . '/px-config.php', $cacheDir . '/px-' . hash('sha256', 'v1/s.js') . '.js') as $path) {
+foreach (array($configFile, $cacheDir . '/px-' . hash('sha256', 'v1/s.js') . '.js') as $path) {
     @unlink($path);
 }
 @rmdir($configDir);

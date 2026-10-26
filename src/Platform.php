@@ -24,6 +24,10 @@ class Platform
     private $options;
     private $modules = array();
     private $protected = false;
+    private $clientIp = null;
+    // The jobs running, innermost last: array(route, started) each. A job
+    // can run another; its errors are named after the inner one.
+    private $jobs = array();
 
     // Options: site_id, secret, endpoint (required); storage, platform (see
     // Core); trust_proxy, mode, counter, on_block (see Firewall); and per
@@ -31,7 +35,9 @@ class Platform
     // or an array of that module's options (errors: server_name, root,
     // before_send; performance: server_name; files: roots and the rest, see
     // Files; off unless given; inventory: root and the rest, see Inventory;
-    // posture: roots and the callbacks, see Posture).
+    // posture: roots and the callbacks, see Posture). server_name names this
+    // service for every module that sends one (errors, performance, crawlers,
+    // resources), so its errors and timings can be told apart from others'.
     public function __construct(array $options)
     {
         $this->core = new Core($options);
@@ -45,6 +51,9 @@ class Platform
                 continue;
             }
             $own = is_array($setting) ? $setting : array();
+            if (!empty($options['server_name']) && in_array($name, array('errors', 'performance', 'crawlers', 'resources'), true)) {
+                $own += array('server_name' => (string) $options['server_name']);
+            }
             try {
                 if ($name === 'proxy') {
                     $this->modules[$name] = new Proxy(
@@ -115,6 +124,23 @@ class Platform
     public function firewall()
     {
         return $this->module('firewall');
+    }
+
+    // The visitor's address: the framework's when it gave one (Laravel's
+    // trusted proxies), else the firewall's trust_proxy rule, else the connection's.
+    public function clientIp()
+    {
+        if ($this->clientIp !== null) {
+            return $this->clientIp;
+        }
+        return isset($this->modules['firewall']) ? $this->modules['firewall']->clientIp() : (isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '');
+    }
+
+    // A framework that already knows the visitor's address passes it here,
+    // per request; null goes back to working it out.
+    public function setClientIp($ip)
+    {
+        $this->clientIp = $ip === null ? null : (string) $ip;
     }
 
     // The browser's visit: the X-Analytics-Session header, else the cookie.
@@ -214,8 +240,7 @@ class Platform
             $body = file_get_contents('php://input', false, null, 0, Proxy::MAX_BODY + 1);
         }
         if ($ip === null) {
-            $firewall = isset($this->modules['firewall']) ? $this->modules['firewall'] : null;
-            $ip = $firewall ? $firewall->clientIp() : (isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '');
+            $ip = $this->clientIp();
         }
         try {
             return $proxy->handle($found[0], $found[1], $method, $query, $headers, $body, $ip);
@@ -229,6 +254,9 @@ class Platform
     {
         if (isset($this->modules['performance'])) {
             $this->modules['performance']->setRoute($route);
+        }
+        if (isset($this->modules['errors'])) {
+            $this->modules['errors']->setRoute($route);
         }
     }
 
@@ -256,8 +284,7 @@ class Platform
         if (!isset($this->modules['maintenance']) || PHP_SAPI === 'cli') {
             return null;
         }
-        $ip = isset($this->modules['firewall']) ? $this->modules['firewall']->clientIp() : (isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '');
-        return Flags::maintenancePage($this->core->maintenance(), $ip);
+        return Flags::maintenancePage($this->core->maintenance(), $this->clientIp());
     }
 
     // Sends maintenance mode's page and ends the request, when it applies.
@@ -283,8 +310,7 @@ class Platform
         if (!isset($this->modules['audit'])) {
             return;
         }
-        $ip = isset($this->modules['firewall']) ? $this->modules['firewall']->clientIp() : (isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '');
-        $this->modules['audit']->record($action, $actor, $target, $details, PHP_SAPI === 'cli' ? '' : $ip);
+        $this->modules['audit']->record($action, $actor, $target, $details, PHP_SAPI === 'cli' ? '' : $this->clientIp());
     }
 
     // The dashboard's security headers, as array(name, value) pairs.
@@ -300,9 +326,8 @@ class Platform
         if (!isset($this->modules['forms'])) {
             return array('ok' => true, 'spam' => false, 'reasons' => array(), 'checked' => false);
         }
-        $ip = isset($this->modules['firewall']) ? $this->modules['firewall']->clientIp() : (isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '');
         try {
-            return $this->modules['forms']->check(is_array($fields) ? $fields : $_POST, $ip, $email, $name, $form);
+            return $this->modules['forms']->check(is_array($fields) ? $fields : $_POST, $this->clientIp(), $email, $name, $form);
         } catch (\Throwable $e) {
             return array('ok' => true, 'spam' => false, 'reasons' => array('unchecked'), 'checked' => false);
         }
@@ -389,6 +414,79 @@ class Platform
         $this->protected = false;
     }
 
+    // A background job (a queue job, a cron task): its errors are sent with
+    // the job's name as their route, and each run is timed (Health → Server
+    // speed → Jobs). A job that throws counts as failed; the exception is
+    // sent and thrown on. A worker never reaches the end of a request, so on
+    // the command line errors are sent after each job.
+    //   $platform->job('send-receipts', function () { ... });
+    public function job($name, callable $fn)
+    {
+        $this->startJob($name);
+        try {
+            $result = $fn();
+        } catch (\Throwable $e) {
+            $this->captureException($e, null, 500, 'error');
+            $this->endJob(true);
+            throw $e;
+        }
+        $this->endJob(false);
+        return $result;
+    }
+
+    // The two halves of job(), for frameworks that announce jobs as events (Laravel's queue).
+    public function startJob($name)
+    {
+        $route = '/(job) ' . substr((string) $name, 0, 180);
+        $this->jobs[] = array($route, microtime(true));
+        if (isset($this->modules['errors'])) {
+            $this->modules['errors']->setJob($route);
+        }
+    }
+
+    public function endJob($failed)
+    {
+        if (!$this->jobs) {
+            return;
+        }
+        list($route, $started) = array_pop($this->jobs);
+        if (isset($this->modules['errors'])) {
+            $outer = end($this->jobs);
+            $this->modules['errors']->setJob($outer ? $outer[0] : '');
+        }
+        $performance = isset($this->modules['performance']) ? $this->modules['performance'] : null;
+        if ($performance) {
+            $performance->recordJob($route, $failed ? 500 : 200, (microtime(true) - $started) * 1000);
+        }
+        if (PHP_SAPI === 'cli') {
+            $this->sendErrors();
+            if ($performance) {
+                $performance->flush();
+            }
+        }
+    }
+
+    // Laravel: sends the errors waiting, and nothing else, from a shutdown
+    // function. A fatal error ends the request before terminate() runs, so
+    // the error Laravel reports at shutdown would otherwise never be sent.
+    public function sendErrors()
+    {
+        $errors = isset($this->modules['errors']) ? $this->modules['errors'] : null;
+        if (!$errors || !$errors->pending()) {
+            return;
+        }
+        try {
+            if (function_exists('fastcgi_finish_request')) {
+                @fastcgi_finish_request();
+            } elseif (function_exists('litespeed_finish_request')) {
+                @litespeed_finish_request();
+            }
+            $errors->flush();
+        } catch (\Throwable $e) {
+            // never break the site
+        }
+    }
+
     // Sends what's waiting and syncs rules and switches when due. Runs at
     // shutdown after protect().
     public function afterResponse()
@@ -410,13 +508,13 @@ class Platform
                 $performance->recordRequest();
             }
             if ($crawlers && $this->protected) {
-                $crawlers->recordRequest($firewall ? $firewall->clientIp() : (isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : ''));
+                $crawlers->recordRequest($this->clientIp());
             }
             // Fatal errors are read now, before deciding whether to send.
             if ($errors) {
                 $errors->onShutdown();
             }
-            $busy = ($errors && $errors->pending()) || ($analytics && $analytics->pending()) || ($audit && $audit->pending()) || $this->core->switchesDue()
+            $busy = ($errors && ($errors->pending() || $errors->due())) || ($analytics && $analytics->pending()) || ($audit && $audit->pending()) || $this->core->switchesDue()
                 || ($performance && $performance->due()) || ($crawlers && $crawlers->due()) || ($resources && $resources->due()) || ($inventory && $inventory->due()) || ($posture && $posture->due());
             // Closes the connection so everything below happens after the
             // response. LiteSpeed has its own name for it, and Apache's

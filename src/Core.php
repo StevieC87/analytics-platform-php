@@ -1,7 +1,7 @@
 <?php
 // What every module of the PHP package shares: the site's credentials, the
 // storage directory, sending to the collector, and the dashboard's module
-// switches (Security → Settings → Server package, GET /events/platform/config).
+// switches (Security → Server package, GET /events/platform/config).
 //
 // PHP keeps nothing between requests, so the switches are kept in the
 // storage directory as a PHP file (OPcache holds it in memory) and fetched
@@ -12,10 +12,14 @@ namespace AnalyticsPlatform;
 
 class Core
 {
-    const VERSION = '0.2.0';
+    const VERSION = '0.3.0';
     const TIMEOUT = 4;
     const MIN_SYNC = 30;
     const RETRY = 60;
+    // Batches the collector couldn't take, kept to be sent again: at most this
+    // many bytes of them, and this many resent per run.
+    const RETRY_MAX = 2000000;
+    const RESEND = 20;
 
     public $options;
     // Appended to the User-Agent, e.g. " (no-rate)" when the firewall can't count.
@@ -184,7 +188,10 @@ class Core
         }
         $res = $this->http('GET', '/events/platform/config?site_id=' . rawurlencode($this->opt('site_id')), null, $headers, 'bearer');
         $switches['fetched'] = time();
-        $switches['sync'] = self::RETRY;
+        // Unchanged (304): the interval the dashboard last gave still holds.
+        if ($res['status'] !== 304) {
+            $switches['sync'] = self::RETRY;
+        }
         if ($res['status'] === 200) {
             $data = json_decode($res['body'], true);
             if (is_array($data) && isset($data['v']) && $data['v'] === 1 && isset($data['modules']) && is_array($data['modules'])) {
@@ -209,6 +216,119 @@ class Core
         fclose($lock);
     }
 
+    // ---- Spools ---------------------------------------------------------------
+    // What a request records for the collector (blocked requests, timings,
+    // crawler hits, machine samples) is appended to <name>.jsonl, one line
+    // each, and sent later by one request at a time. A batch the collector
+    // couldn't take, when trying again may work (unreachable, 429, 5xx), is
+    // kept in <name>.retry.jsonl and sent before the next one; a 4xx is
+    // dropped, because resending won't make it acceptable.
+
+    // False when the spool is full (more than $max bytes) or can't be written.
+    public function append($name, array $row, $max)
+    {
+        $file = $this->dir . '/' . $name . '.jsonl';
+        clearstatcache(true, $file);
+        if (is_file($file) && filesize($file) > $max) {
+            return false;
+        }
+        return @file_put_contents($file, json_encode($row, JSON_INVALID_UTF8_SUBSTITUTE) . "\n", FILE_APPEND | LOCK_EX) !== false;
+    }
+
+    // Whether anything is waiting to be sent, new or to be resent.
+    public function waiting($name)
+    {
+        clearstatcache();
+        return is_file($this->dir . '/' . $name . '.jsonl') || is_file($this->dir . '/' . $name . '.retry.jsonl');
+    }
+
+    // Whether the last send was at least $every seconds ago.
+    public function sendDue($name, $every)
+    {
+        $mark = $this->dir . '/' . $name . '.lock';
+        clearstatcache(true, $mark);
+        return !is_file($mark) || filemtime($mark) <= time() - $every;
+    }
+
+    // Takes everything waiting in the spool and hands its rows to $send,
+    // which sends them with post(). At most every $every seconds unless
+    // $force, and one request at a time.
+    public function drain($name, $every, $force, callable $send)
+    {
+        if (!$this->waiting($name) || (!$force && !$this->sendDue($name, $every))) {
+            return;
+        }
+        $lock = @fopen($this->dir . '/' . $name . '.lock', 'c');
+        if (!$lock || !flock($lock, LOCK_EX | LOCK_NB)) {
+            return;
+        }
+        @touch($this->dir . '/' . $name . '.lock');
+        try {
+            $this->resend($name);
+            $rows = array();
+            foreach ($this->take($this->dir . '/' . $name . '.jsonl') as $line) {
+                $row = json_decode($line, true);
+                if (is_array($row)) {
+                    $rows[] = $row;
+                }
+            }
+            if ($rows) {
+                $send($rows);
+            }
+        } finally {
+            flock($lock, LOCK_UN);
+            fclose($lock);
+        }
+    }
+
+    // POSTs one batch for the spool $name, keeping it to resend when the
+    // collector couldn't take it. The credentials are added when it is sent,
+    // so they are never written down with it.
+    public function post($name, $path, array $body, $auth = 'body')
+    {
+        $res = $this->http('POST', $path, $body, array(), $auth);
+        if ($res['status'] === 0 || $res['status'] === 429 || $res['status'] >= 500) {
+            $this->append($name . '.retry', array('path' => $path, 'auth' => $auth, 'body' => $body), self::RETRY_MAX);
+        }
+        return $res;
+    }
+
+    // Sends what earlier runs couldn't, oldest first. Once one fails the
+    // collector is still away, so the rest go back unsent.
+    private function resend($name)
+    {
+        $file = $this->dir . '/' . $name . '.retry.jsonl';
+        $lines = $this->take($file);
+        foreach ($lines as $i => $line) {
+            $batch = json_decode($line, true);
+            if (!is_array($batch) || !isset($batch['path'], $batch['body']) || !is_array($batch['body'])
+                || strpos((string) $batch['path'], '/events/') !== 0) {
+                continue;
+            }
+            $auth = isset($batch['auth']) && $batch['auth'] === 'bearer' ? 'bearer' : 'body';
+            $res = $i < self::RESEND ? $this->http('POST', $batch['path'], $batch['body'], array(), $auth) : array('status' => 0);
+            if ($res['status'] === 0 || $res['status'] === 429 || $res['status'] >= 500) {
+                $rest = array_slice($lines, $i);
+                @file_put_contents($file, implode("\n", $rest) . "\n", FILE_APPEND | LOCK_EX);
+                return;
+            }
+        }
+    }
+
+    // The lines of a spool file, which is removed: renamed first, so lines
+    // other requests append meanwhile start a new file rather than being lost.
+    private function take($file)
+    {
+        $sending = $file . '.' . getmypid() . '.sending';
+        clearstatcache(true, $file);
+        if (!is_file($file) || !@rename($file, $sending)) {
+            return array();
+        }
+        $lines = file($sending, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: array();
+        @unlink($sending);
+        return $lines;
+    }
+
     // ---- HTTP ---------------------------------------------------------------
 
     // auth 'bearer' sends the secret as a header (firewall, switches); 'body'
@@ -223,7 +343,9 @@ class Core
             if ($auth === 'body') {
                 $body = array('site_id' => (string) $this->opt('site_id'), 'sitesecret' => (string) $this->opt('secret')) + $body;
             }
-            $body = json_encode($body);
+            // A name that isn't UTF-8 (a file, a path) has its bad bytes
+            // replaced rather than failing the encoding and losing the whole body.
+            $body = json_encode($body, JSON_INVALID_UTF8_SUBSTITUTE);
             $headers[] = 'Content-Type: application/json';
         }
         if ($auth === 'bearer') {
