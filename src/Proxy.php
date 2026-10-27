@@ -44,19 +44,31 @@ class Proxy
     private $endpoint;
     private $prefix;
     private $dir;
+    private $key;
 
     // $dir: a writable folder for the copy of each tracker file. PHP keeps
     // nothing between requests, so without one every visitor costs us a fetch.
-    public function __construct($endpoint, $secret, $dir = '', $prefix = '')
+    // $key: the proxy key, for a caller that has it but not the secret (px.php).
+    public function __construct($endpoint, $secret, $dir = '', $prefix = '', $key = '')
     {
         $this->endpoint = rtrim((string) $endpoint, '/');
         $this->dir = (string) $dir;
         $this->prefix = preg_replace('/[^A-Za-z0-9_-]/', '', $prefix !== '' ? (string) $prefix : self::prefixFor($secret));
+        $key = $key !== '' ? (string) $key : ((string) $secret !== '' ? self::keyFor($secret) : '');
+        $this->key = preg_replace('/[^a-f0-9]/', '', $key);
     }
 
     public static function prefixFor($secret)
     {
         return substr(hash('sha256', 'proxy|' . (string) $secret), 0, 8);
+    }
+
+    // Sent as X-Proxy-Key, so the collector believes the visitor addresses
+    // this proxy passes on: anyone can write X-Forwarded-For. Worked out from
+    // the secret as the collector does (expresscollect/utils/proxyKey.js).
+    public static function keyFor($secret)
+    {
+        return substr(hash('sha256', 'proxykey|' . (string) $secret), 0, 32);
     }
 
     public function prefix()
@@ -179,6 +191,9 @@ class Proxy
         // The visitor's address: the collector needs it for the country, the
         // daily visitor ID and the per-visitor rate limit.
         $out = array('X-Forwarded-For: ' . (string) $clientIp);
+        if ($this->key !== '') {
+            $out[] = 'X-Proxy-Key: ' . $this->key;
+        }
         foreach (self::PASS_HEADERS as $key => $name) {
             if (!empty($headers[$key])) {
                 $out[] = $name . ': ' . str_replace(array("\r", "\n"), '', (string) $headers[$key]);

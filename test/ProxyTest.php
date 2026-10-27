@@ -117,6 +117,9 @@ foreach (array($configFile, $cacheDir . '/px-' . hash('sha256', 'v1/s.js') . '.j
 // The path in the config is the one px.php answers on: if it ever worked one
 // out for itself instead, every visit would 404 and nothing would be counted.
 check('the configured path is the one served', (new AnalyticsPlatform\Proxy('http://127.0.0.1:1', '', '', $prefix))->scriptUrl() === '/' . $prefix . '/js/v1/s.js');
+// The same vector is pinned in the collector, the backend and the other packages.
+check('the proxy key is worked out as the collector does',
+    AnalyticsPlatform\Proxy::keyFor('0123456789abcdef01234567') === '8fc74dbbd4f088449862841cd29fcaee');
 check('the path comes from the secret, not the site id', $prefix === AnalyticsPlatform\Proxy::prefixFor('s3cret')
     && $prefix !== AnalyticsPlatform\Proxy::prefixFor('other'));
 

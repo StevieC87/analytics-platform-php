@@ -12,7 +12,7 @@ namespace AnalyticsPlatform;
 
 class Core
 {
-    const VERSION = '0.3.0';
+    const VERSION = '0.3.1';
     const TIMEOUT = 4;
     const MIN_SYNC = 30;
     const RETRY = 60;
