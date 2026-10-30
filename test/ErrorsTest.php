@@ -151,6 +151,32 @@ foreach (glob($jobDir . '/{,.}*', GLOB_BRACE) ?: array() as $path) {
 @rmdir($jobDir);
 @rmdir($jobStore);
 
+// The trail: an error carries the steps before it, and only its own.
+$core->sent = array();
+$trail = new Errors($core);
+$trail->captureException(new RuntimeException('no steps yet'));
+for ($i = 0; $i < 20; $i++) {
+    $trail->addBreadcrumb('step ' . $i);
+}
+$trail->addRequestBreadcrumb('post', 'https://api.example/charge?card=4242#top', 502);
+$trail->addRequestBreadcrumb('GET', 'https://api.example/down', 0);
+$trail->captureException(new RuntimeException('after the steps'));
+$trail->clearBreadcrumbs();
+$trail->captureException(new RuntimeException('next request'));
+$trail->addBreadcrumb('in a job');
+$trail->setJob('/(job) one');
+$trail->captureException(new RuntimeException('in the job'));
+$trail->flush();
+$sent = $sentErrors();
+$crumbs = isset($sent[1]['breadcrumbs']) ? $sent[1]['breadcrumbs'] : array();
+check('an error before any step has no trail', !isset($sent[0]['breadcrumbs']));
+check('the trail keeps the last 15 steps', count($crumbs) === 15 && $crumbs[0]['text'] === 'step 7');
+check('a request has its method and status, and no query string', $crumbs[13] === array('type' => 'request', 'text' => 'POST https://api.example/charge', 'status' => 502, 'ms' => $crumbs[13]['ms']));
+check('no answer is status 0', $crumbs[14]['status'] === 0 && $crumbs[14]['text'] === 'GET https://api.example/down');
+check('steps carry how long ago, not when', is_int($crumbs[0]['ms']) && !isset($crumbs[0]['at']));
+check('the next request starts a new trail', !isset($sent[2]['breadcrumbs']));
+check('a job starts a new trail', !isset($sent[3]['breadcrumbs']));
+
 foreach (glob($core->dir() . '/*') ?: array() as $path) {
     @unlink($path);
 }

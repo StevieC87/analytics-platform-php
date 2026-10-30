@@ -6,7 +6,9 @@
 // shutdown); captureException() sends errors you catch. An error is sent
 // once however many of those see it. Errors wait in memory and are sent after
 // the response (Platform::afterResponse); a batch the collector couldn't take
-// waits on disk and is sent again by a later request.
+// waits on disk and is sent again by a later request. Each error carries the
+// trail of its request or job: the steps you add with addBreadcrumb(), and the
+// outgoing requests of frameworks that announce them (WordPress, Laravel).
 
 namespace AnalyticsPlatform;
 
@@ -17,6 +19,8 @@ class Errors
     const FATAL = 85; // E_ERROR | E_PARSE | E_CORE_ERROR | E_COMPILE_ERROR
     // Seconds between tries at the batches the collector couldn't take.
     const RESEND_EVERY = 60;
+    // Steps kept in the trail of a request or job.
+    const CRUMB_MAX = 15;
 
     private $core;
     private $options;
@@ -32,6 +36,8 @@ class Errors
     private $route = '';
     // The background job running (Platform::job), whose name is the route.
     private $job = '';
+    // The current request or job's steps, oldest first.
+    private $crumbs = array();
 
     // Options: server_name (default the host name), root (paths are made
     // relative to it; default the document root's parent), release (which build
@@ -132,6 +138,48 @@ class Errors
     public function setJob($route)
     {
         $this->job = (string) $route;
+        $this->clearBreadcrumbs();
+    }
+
+    // A step of your own in the trail shown before an error.
+    public function addBreadcrumb($text)
+    {
+        $this->crumb(array('type' => 'note', 'text' => (string) $text));
+    }
+
+    // An outgoing request that has finished; $status is 0 when no answer came.
+    public function addRequestBreadcrumb($method, $url, $status)
+    {
+        $url = preg_split('/[?#]/', (string) $url, 2)[0];
+        $this->crumb(array('type' => 'request', 'text' => strtoupper((string) $method) . ' ' . $url, 'status' => (int) $status));
+    }
+
+    private function crumb(array $crumb)
+    {
+        $crumb['text'] = substr($crumb['text'], 0, 200);
+        $crumb['at'] = microtime(true);
+        $this->crumbs[] = $crumb;
+        if (count($this->crumbs) > self::CRUMB_MAX) {
+            array_shift($this->crumbs);
+        }
+    }
+
+    // A worker that serves many requests calls this between them, so one
+    // visitor's steps never appear before another's error.
+    public function clearBreadcrumbs()
+    {
+        $this->crumbs = array();
+    }
+
+    // The trail as the tracker sends it: how long before now each step happened.
+    private function breadcrumbs()
+    {
+        $now = microtime(true);
+        return array_map(function ($crumb) use ($now) {
+            $crumb['ms'] = (int) round(max(0, $now - $crumb['at']) * 1000);
+            unset($crumb['at']);
+            return $crumb;
+        }, $this->crumbs);
     }
 
     public function requestFields()
@@ -228,6 +276,9 @@ class Errors
             // When it happened: an error resent by a later request keeps its own time.
             'at' => gmdate('Y-m-d\TH:i:s\Z'),
         );
+        if ($this->crumbs) {
+            $event['breadcrumbs'] = $this->breadcrumbs();
+        }
         if (is_callable($this->options['before_send'])) {
             $event = call_user_func($this->options['before_send'], $event, $error);
             if (!$event) {

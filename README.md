@@ -98,6 +98,12 @@ the route `setRoute()` named. One exception is sent once however often it is
 captured, and a batch the collector couldn't take is kept on disk and sent by
 a later request; each error keeps the time it happened.
 
+An error also shows the steps before it in its request or job. Add your own
+with `$platform->addBreadcrumb('Order saved')`. In Laravel, calls made with its
+`Http` client are recorded on their own, with their address (no query string)
+and status. Plain PHP can't see outgoing calls, so there it's only your own
+steps. To send none, unset `$event['breadcrumbs']` in `before_send`.
+
 Background jobs (a worker, a cron script):
 
 ```php

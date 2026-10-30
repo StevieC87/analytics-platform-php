@@ -58,6 +58,8 @@ class FirewallServiceProvider extends ServiceProvider
     public function boot()
     {
         $this->publishes(array(__DIR__ . '/config.php' => config_path('analytics-firewall.php')), 'analytics-firewall');
+        // Before the return below: a queue job's calls are steps of its trail too.
+        $this->breadcrumbs();
         if ($this->app->runningInConsole()) {
             $this->queueJobs();
             return;
@@ -110,6 +112,27 @@ class FirewallServiceProvider extends ServiceProvider
                 if ($error instanceof \Throwable && in_array($e->level, array('error', 'critical', 'alert', 'emergency'), true)) {
                     $this->app->make(Platform::class)->captureException($error, $this->requestFields(), 0, 'logged');
                 }
+            });
+        }
+    }
+
+    // What Laravel's HTTP client asked other services for: steps in the trail
+    // shown before an error. Its events are public, so nothing is patched.
+    private function breadcrumbs()
+    {
+        $events = $this->app['events'];
+        if (class_exists('Illuminate\\Http\\Client\\Events\\ResponseReceived')) {
+            $events->listen('Illuminate\\Http\\Client\\Events\\ResponseReceived', function ($e) {
+                $this->app->make(Platform::class)->addRequestBreadcrumb($e->request->method(), $e->request->url(), $e->response->status());
+            });
+            $events->listen('Illuminate\\Http\\Client\\Events\\ConnectionFailed', function ($e) {
+                $this->app->make(Platform::class)->addRequestBreadcrumb($e->request->method(), $e->request->url(), 0);
+            });
+        }
+        // Octane serves many requests from one process.
+        if (class_exists('Illuminate\\Foundation\\Http\\Events\\RequestHandled')) {
+            $events->listen('Illuminate\\Foundation\\Http\\Events\\RequestHandled', function () {
+                $this->app->make(Platform::class)->clearBreadcrumbs();
             });
         }
     }

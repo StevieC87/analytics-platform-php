@@ -267,6 +267,31 @@ class Platform
         }
     }
 
+    // A step of your own in the trail shown before an error in this request or job.
+    public function addBreadcrumb($text)
+    {
+        if (isset($this->modules['errors'])) {
+            $this->modules['errors']->addBreadcrumb($text);
+        }
+    }
+
+    // An outgoing request that has finished, for frameworks that announce them;
+    // $status is 0 when no answer came.
+    public function addRequestBreadcrumb($method, $url, $status)
+    {
+        if (isset($this->modules['errors'])) {
+            $this->modules['errors']->addRequestBreadcrumb($method, $url, $status);
+        }
+    }
+
+    // Between requests, in a worker that serves many (Octane).
+    public function clearBreadcrumbs()
+    {
+        if (isset($this->modules['errors'])) {
+            $this->modules['errors']->clearBreadcrumbs();
+        }
+    }
+
     // A feature flag from the dashboard ($user: for rollouts and user lists;
     // $default: until the flag is known, or with the module off).
     public function isEnabled($key, $user = null, $default = false)
