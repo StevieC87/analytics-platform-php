@@ -113,7 +113,9 @@ $platform->job('send-receipts', function () { /* ... */ });
 Their errors carry the job's name as the route, a job that throws is sent
 (status 500) and thrown on, each run is timed (Server speed → Jobs), and on
 the command line errors are sent after every job. Several services on one
-site: `'server_name' => 'worker'` in the options.
+site: `'server_name' => 'worker'` in the options. Health → All systems lists
+each by that name; PHP checks in only while it serves requests, so a quiet
+site is never called down (`sdk/protocols/checkin.md`).
 
 ## Laravel
 

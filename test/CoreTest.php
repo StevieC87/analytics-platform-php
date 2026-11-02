@@ -98,6 +98,15 @@ $fresh->answers = array(0);
 $fresh->syncSwitches(true);
 check('an unreachable collector is tried again within a minute', $fresh->readPhp('switches.php')['sync'] === Core::RETRY);
 
+// The check-in on the switches request (X-Platform-App): which site's PHP is
+// asking, form-encoded so any name is plain ASCII, and "request", since PHP
+// has no process to watch between requests.
+parse_str((new Core(array('site_id' => str_repeat('a', 24), 'secret' => 's', 'endpoint' => 'http://c', 'server_name' => 'web wörker')))->checkIn(), $app);
+check('the check-in names the server', $app['server'] === 'web wörker');
+check('PHP checks in per request', $app['kind'] === 'request' && strpos($app['runtime'], 'PHP ') === 0);
+$named = (new Core(array('site_id' => str_repeat('a', 24), 'secret' => 's', 'endpoint' => 'http://c')))->checkIn();
+check('without server_name, the host name, in plain ASCII', strpos($named, 'server=') === 0 && !preg_match('/[^\x20-\x7e]/', $named));
+
 foreach (glob($core->dir() . '/*') ?: array() as $path) {
     @unlink($path);
 }

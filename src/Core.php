@@ -12,7 +12,7 @@ namespace AnalyticsPlatform;
 
 class Core
 {
-    const VERSION = '0.3.2';
+    const VERSION = '0.3.3';
     const TIMEOUT = 4;
     const MIN_SYNC = 30;
     const RETRY = 60;
@@ -52,6 +52,25 @@ class Core
         $this->dir = $base . '/' . ($id === '' ? '' : $id . '-' . substr(hash('sha256', $id . '|' . (string) $this->opt('secret')), 0, 16));
         // Where it used to be, when the name was guessable.
         $this->legacyDir = $id === '' ? '' : $base . '/' . $id;
+    }
+
+    // This site's check-in, on the switches request: server_name (default the
+    // host name, as every module sends it) and the PHP version, form-encoded
+    // so any name is plain ASCII. "request": PHP runs per request, so there is
+    // no process to watch, and a quiet night isn't an outage.
+    public function checkIn()
+    {
+        // Falls back as the modules' does (Platform.php passes it only when
+        // not empty()), so the check-in and the data share one name.
+        $server = $this->opt('server_name');
+        if (empty($server)) {
+            $server = function_exists('gethostname') ? (string) gethostname() : '';
+        }
+        return http_build_query(array(
+            'server' => substr((string) $server, 0, 100),
+            'kind' => 'request',
+            'runtime' => 'PHP ' . PHP_VERSION,
+        ), '', '&', PHP_QUERY_RFC3986);
     }
 
     public function opt($key)
@@ -182,7 +201,7 @@ class Core
             return;
         }
         $switches = $this->switches();
-        $headers = array('X-Platform-Modules: ' . implode(',', $this->loaded));
+        $headers = array('X-Platform-Modules: ' . implode(',', $this->loaded), 'X-Platform-App: ' . $this->checkIn());
         if ($switches['etag'] !== '' && !$force) {
             $headers[] = 'If-None-Match: ' . $switches['etag'];
         }
