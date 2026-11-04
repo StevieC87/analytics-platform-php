@@ -44,8 +44,16 @@ class Flags
         return self::bucket($key, $id) < $rollout;
     }
 
-    // Null to let the request through; otherwise the page to send.
-    public static function maintenancePage(array $m, $ip)
+    // The preview cookie's options: a day, the whole site, not for scripts,
+    // and Secure over https, so the code never travels in the clear.
+    public static function cookieOptions($secure)
+    {
+        return array('expires' => time() + 86400, 'path' => '/', 'secure' => (bool) $secure, 'httponly' => true, 'samesite' => 'Lax');
+    }
+
+    // Null to let the request through; otherwise the page to send. $secure:
+    // the request came over https, so the preview cookie is set Secure.
+    public static function maintenancePage(array $m, $ip, $secure = false)
     {
         if (empty($m['on'])) {
             return null;
@@ -56,13 +64,15 @@ class Flags
         }
         $code = isset($m['bypass']) ? (string) $m['bypass'] : '';
         if ($code !== '') {
-            if (isset($_GET[self::COOKIE]) && hash_equals($code, (string) $_GET[self::COOKIE])) {
+            // Compared in constant time (hash_equals), so the code can't be
+            // worked out a character at a time from how long the answer takes.
+            if (isset($_GET[self::COOKIE]) && is_string($_GET[self::COOKIE]) && hash_equals($code, $_GET[self::COOKIE])) {
                 if (!headers_sent()) {
-                    setcookie(self::COOKIE, $code, array('expires' => time() + 86400, 'path' => '/', 'httponly' => true, 'samesite' => 'Lax'));
+                    setcookie(self::COOKIE, $code, self::cookieOptions($secure));
                 }
                 return null;
             }
-            if (isset($_COOKIE[self::COOKIE]) && hash_equals($code, (string) $_COOKIE[self::COOKIE])) {
+            if (isset($_COOKIE[self::COOKIE]) && is_string($_COOKIE[self::COOKIE]) && hash_equals($code, $_COOKIE[self::COOKIE])) {
                 return null;
             }
         }

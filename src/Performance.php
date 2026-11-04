@@ -19,6 +19,11 @@ class Performance
     const BUCKET_EDGES_MS = array(5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000);
     const FLUSH_EVERY = 60;
     const MAX_KEYS = 300;
+    // Past MAX_KEYS new routes fold into "(other)"; past this nothing new is
+    // kept at all.
+    const HARD_MAX_KEYS = 400;
+    // The method is the visitor's to choose: anything else is one "OTHER".
+    const METHODS = array('GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'JOB');
     const MAX_ROWS = 500;
     const SPOOL_MAX = 5000000; // bytes waiting; more requests aren't recorded
     const NOT_FOUND = '/(not found)';
@@ -40,15 +45,22 @@ class Performance
         $this->route = substr((string) $route, 0, 200);
     }
 
+    // A request's method as Server speed keeps it: one of METHODS, else "OTHER".
+    public static function method($method)
+    {
+        $name = strtoupper(trim((string) $method));
+        return in_array($name, self::METHODS, true) ? $name : 'OTHER';
+    }
+
     public static function normalizeRoute($path)
     {
         $path = explode('?', (string) $path, 2)[0];
         $path = explode('#', $path, 2)[0];
         $parts = array();
         foreach (explode('/', $path === '' ? '/' : $path) as $segment) {
-            $isId = preg_match('/^\d+$/', $segment)
-                || preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i', $segment)
-                || preg_match('/^[0-9a-f]{16,}$/i', $segment)
+            $isId = preg_match('/^\d+$/D', $segment)
+                || preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/Di', $segment)
+                || preg_match('/^[0-9a-f]{16,}$/Di', $segment)
                 || (strlen($segment) >= 20 && preg_match('/\d/', $segment));
             $parts[] = $isId ? ':id' : $segment;
         }
@@ -56,35 +68,47 @@ class Performance
         return substr($route[0] === '/' ? $route : '/' . $route, 0, 200);
     }
 
-    // Records the current request (Platform calls it at shutdown).
+    // Records the current request (Platform calls it at shutdown). Returns
+    // what it was recorded under (t, m, r), for the queries that ran in it
+    // (Queries::endRequest), or null when it wasn't.
     public function recordRequest()
     {
         if (!$this->core->isOn('performance') || !$this->core->ensureDir()) {
-            return;
+            return null;
         }
         $started = isset($_SERVER['REQUEST_TIME_FLOAT']) ? (float) $_SERVER['REQUEST_TIME_FLOAT'] : microtime(true);
         $status = (int) http_response_code();
         $status = $status ?: 200;
+        // The visitor went away mid-answer: a 500 from writing to the closed
+        // connection is not the site's, and its time is not the request's.
+        if ($status >= 500 && function_exists('connection_aborted') && connection_aborted()) {
+            $this->route = '';
+            return null;
+        }
         $route = $this->route !== '' ? $this->route
             : ($status === 404 ? self::NOT_FOUND : self::normalizeRoute(isset($_SERVER['REQUEST_URI']) ? $_SERVER['REQUEST_URI'] : '/'));
-        $this->core->append('requests', array(
+        $line = array(
             't' => time(),
-            'm' => substr(strtoupper(isset($_SERVER['REQUEST_METHOD']) ? $_SERVER['REQUEST_METHOD'] : 'GET'), 0, 10),
+            'm' => self::method(isset($_SERVER['REQUEST_METHOD']) ? $_SERVER['REQUEST_METHOD'] : 'GET'),
             'r' => $route,
             's' => $status,
             'd' => round((microtime(true) - $started) * 1000, 1),
-        ), self::SPOOL_MAX);
+        );
         $this->route = '';
+        return $this->core->append('requests', $line, self::SPOOL_MAX) ? $line : null;
     }
 
-    // A background job's run (Platform::job), timed like a request.
+    // A background job's run (Platform::job), timed like a request. Returns
+    // what it was recorded under (t, m, r), for the job's queries
+    // (Queries::endJob), or null when it wasn't.
     public function recordJob($route, $status, $ms)
     {
         if (!$this->core->isOn('performance') || !$this->core->ensureDir()) {
-            return;
+            return null;
         }
-        $this->core->append('requests', array('t' => time(), 'm' => 'JOB', 'r' => substr((string) $route, 0, 200),
-            's' => (int) $status, 'd' => round((float) $ms, 1)), self::SPOOL_MAX);
+        $line = array('t' => time(), 'm' => 'JOB', 'r' => substr((string) $route, 0, 200),
+            's' => (int) $status, 'd' => round((float) $ms, 1));
+        return $this->core->append('requests', $line, self::SPOOL_MAX) ? $line : null;
     }
 
     public function due()
@@ -113,14 +137,19 @@ class Performance
                 }
                 $minute = (int) (floor($r['t'] / 60) * 60);
                 $route = (string) $r['r'];
-                $key = json_encode(array($minute, $r['m'], $route, $r['s']));
+                // Mapped again here: a line written by an older version.
+                $method = self::method($r['m']);
+                $key = json_encode(array($minute, $method, $route, $r['s']));
                 if (!isset($rows[$key]) && count($rows) >= self::MAX_KEYS) {
                     $route = '(other)';
-                    $key = json_encode(array($minute, $r['m'], $route, $r['s']));
+                    $key = json_encode(array($minute, $method, $route, $r['s']));
+                }
+                if (!isset($rows[$key]) && count($rows) >= self::HARD_MAX_KEYS) {
+                    continue;
                 }
                 if (!isset($rows[$key])) {
                     $rows[$key] = array(
-                        'minute' => gmdate('Y-m-d\TH:i:s\Z', $minute), 'method' => $r['m'], 'route' => $route, 'status' => (int) $r['s'],
+                        'minute' => gmdate('Y-m-d\TH:i:s\Z', $minute), 'method' => $method, 'route' => $route, 'status' => (int) $r['s'],
                         'count' => 0, 'sum_ms' => 0.0, 'max_ms' => 0.0, 'buckets' => array_fill(0, count(self::BUCKET_EDGES_MS) + 1, 0),
                     );
                 }

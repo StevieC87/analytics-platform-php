@@ -11,6 +11,7 @@ class Audit
 {
     const BATCH = 100;
     const QUEUE_MAX = 500;
+    const RESEND_EVERY = 60;
 
     private $core;
     private $queue = array();
@@ -31,7 +32,8 @@ class Audit
             'action' => substr($action, 0, 64),
             'actor' => substr((string) $actor, 0, 200),
             'target' => substr((string) $target, 0, 300),
-            'details' => $details,
+            // Made plain now, so a value JSON can't hold can't fail the batch.
+            'details' => Core::plain($details),
             'actor_ip' => (string) $ip,
             'session_id' => Platform::sessionIdFromRequest(),
         );
@@ -47,7 +49,14 @@ class Audit
         $waiting = $this->queue;
         $this->queue = array();
         foreach (array_chunk($waiting, self::BATCH) as $batch) {
-            $this->core->http('POST', '/events/audit', array('entries' => $batch), array(), 'body');
+            $this->core->post('audit', '/events/audit', array('entries' => $batch));
         }
+        $this->core->drain('audit', self::RESEND_EVERY, false, function () {
+        });
+    }
+
+    public function due()
+    {
+        return $this->core->waiting('audit') && $this->core->sendDue('audit', self::RESEND_EVERY);
     }
 }

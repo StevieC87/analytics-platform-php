@@ -11,6 +11,7 @@ class Analytics
 {
     const BATCH = 100;
     const QUEUE_MAX = 500;
+    const RESEND_EVERY = 60;
 
     private $core;
     private $events = array();
@@ -28,6 +29,13 @@ class Analytics
     {
         if (!is_string($name) || $name === '' || !$this->core->isOn('analytics') || count($this->events) >= self::QUEUE_MAX) {
             return '';
+        }
+        // Made plain now (Core::plain): a value JSON can't hold (a resource,
+        // NAN, a recursive object) is dropped from the event here rather
+        // than failing the whole batch it would be sent in.
+        $fields = Core::plain($fields);
+        if (!is_array($fields)) {
+            $fields = array();
         }
         $event = $fields + array(
             'timestamp' => gmdate('Y-m-d\TH:i:s\Z'),
@@ -80,12 +88,23 @@ class Analytics
         $identities = $this->identities;
         $this->events = array();
         $this->identities = array();
+        // A batch the collector couldn't take (or that the deadline after the
+        // response left unsent) waits in analytics.retry.jsonl for a later
+        // request; event_uid keeps a resent one from counting twice.
         foreach (array_chunk($events, self::BATCH) as $batch) {
-            $this->core->http('POST', '/events/server-events', array('events' => $batch), array(), 'body');
+            $this->core->post('analytics', '/events/server-events', array('events' => $batch));
         }
         foreach ($identities as $identity) {
-            $this->core->http('POST', '/events/identify', $identity, array(), 'body');
+            $this->core->post('analytics', '/events/identify', $identity);
         }
+        $this->core->drain('analytics', self::RESEND_EVERY, false, function () {
+        });
+    }
+
+    // Batches an earlier request couldn't send are waiting, and it's time to try them.
+    public function due()
+    {
+        return $this->core->waiting('analytics') && $this->core->sendDue('analytics', self::RESEND_EVERY);
     }
 
     private static function uuid()

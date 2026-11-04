@@ -183,7 +183,7 @@ class Inventory
         $host = function_exists('gethostname') ? (string) gethostname() : '';
         $result = $this->core->http('POST', '/events/inventory', array(
             'site_id' => (string) $this->core->opt('site_id'),
-            'host' => preg_match('/^[A-Za-z0-9._-]{1,100}$/', $host) ? $host : 'server',
+            'host' => preg_match('/^[A-Za-z0-9._-]{1,100}$/D', $host) ? $host : 'server',
             'at' => gmdate('Y-m-d\TH:i:s\Z'),
             'runtime' => $runtime,
             'packages' => array_slice($packages, 0, self::MAX_PACKAGES),

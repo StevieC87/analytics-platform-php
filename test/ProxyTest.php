@@ -106,13 +106,58 @@ foreach (array('PUT', 'DELETE') as $method) {
 file_put_contents($cacheDir . '/px-' . hash('sha256', 'v1/s.js') . '.js', str_repeat("// cached tracker\n", 60));
 check('falls back to the cached tracker', strpos(run($px, '/js/v1/s.js'), 'cached tracker') !== false);
 
+// A denied address gets nothing: px.php reads the firewall's rules from the
+// storage folder (the config names the site, whose bans they are) before it
+// forwards anything. run() connects from 203.0.113.9.
+require_once __DIR__ . '/../src/Core.php';
+require_once __DIR__ . '/../src/Firewall.php';
+file_put_contents($configFile, "<?php\nreturn " . var_export(array(
+    'endpoint' => 'http://127.0.0.1:1', 'trust_proxy' => '0', 'dir' => $cacheDir, 'prefix' => $prefix,
+    'site_id' => 'a1b2c3d4e5f6a1b2c3d4e5f6',
+), true) . ";\n");
+$rules = array('v' => 1, 'etag' => '', 'fetched' => time(), 'enabled' => true, 'mode' => 'block', 'sync' => 60, 'rate' => null,
+    'ban' => 0, 'login' => null, 'probes' => null, 'requests' => array(), 'challenge' => null);
+foreach (AnalyticsPlatform\Firewall::RULES as $list) {
+    $rules[$list] = AnalyticsPlatform\Firewall::compileList($list === 'deny' ? array('203.0.113.0/24') : array());
+}
+file_put_contents($cacheDir . '/rules.php', "<?php\nreturn " . var_export($rules, true) . ";\n");
+$out = run($px, '/api/e', 'POST');
+check('a denied address is refused before anything is forwarded', strpos($out, 'Forbidden') !== false);
+check('and reported for the dashboard', strpos((string) @file_get_contents($cacheDir . '/events.jsonl'), '"rule":"deny"') !== false);
+$rules['mode'] = 'monitor';
+file_put_contents($cacheDir . '/rules.php', "<?php\nreturn " . var_export($rules, true) . ";\n");
+check('in monitor mode it is only reported', strpos(run($px, '/api/e', 'POST'), 'Forbidden') === false);
+
 foreach (array($configFile, $cacheDir . '/px-' . hash('sha256', 'v1/s.js') . '.js') as $path) {
+    @unlink($path);
+}
+foreach (glob($cacheDir . '/*') ?: array() as $path) {
     @unlink($path);
 }
 @rmdir($configDir);
 @rmdir(dirname($configDir));
 @rmdir(dirname($configDir, 2));
 @rmdir($cacheDir);
+
+// px.php's own copy of the address rule: CF-Connecting-IP only from
+// Cloudflare's addresses, as Firewall::clientIp() has it.
+require_once __DIR__ . '/../src/Firewall.php';
+preg_match('/function sa_px_client_ip\(\$trust\)\s*\{.*?\n\}\n/s', (string) file_get_contents($px), $fn);
+check('px.php has its address rule', !empty($fn[0]));
+if (!empty($fn[0])) {
+    eval($fn[0]);
+    $_SERVER['HTTP_CF_CONNECTING_IP'] = '198.51.100.7';
+    $_SERVER['REMOTE_ADDR'] = '172.68.10.20';
+    check('px.php believes the header from Cloudflare', sa_px_client_ip('cloudflare') === '198.51.100.7');
+    $_SERVER['REMOTE_ADDR'] = '203.0.113.50';
+    check('and from nobody else', sa_px_client_ip('cloudflare') === '203.0.113.50');
+    $_SERVER['HTTP_X_FORWARDED_FOR'] = '192.0.2.1, 198.51.100.8:4431';
+    check('px.php drops a port on the hop, as the firewall does', sa_px_client_ip('1') === '198.51.100.8');
+    $_SERVER['HTTP_X_FORWARDED_FOR'] = 'garbage';
+    check('and falls back to the connection for a hop that is no address', sa_px_client_ip('1') === '203.0.113.50');
+    unset($_SERVER['HTTP_X_FORWARDED_FOR']);
+    unset($_SERVER['HTTP_CF_CONNECTING_IP'], $_SERVER['REMOTE_ADDR']);
+}
 
 // The path in the config is the one px.php answers on: if it ever worked one
 // out for itself instead, every visit would 404 and nothing would be counted.

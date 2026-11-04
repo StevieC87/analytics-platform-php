@@ -33,7 +33,18 @@ class Proxy
     // is held for an hour, the same as the collector serves it with.
     const TTL_PINNED = 604800;
     const TTL_MAJOR = 3600;
-    const TIMEOUT = 5;
+    // Short, because a visitor's request (a PHP worker) waits on them: a
+    // collector that has gone quiet must not hold every worker of the site.
+    const CONNECT_TIMEOUT = 1;
+    const TIMEOUT = 2;
+    // After this many failures in a row the collector is left alone for
+    // BREAKER_OPEN seconds: beacons are answered 502 straight away, and the
+    // tracker comes from the copy on disk when there is one. Then one
+    // request tries again; the others keep the short answer until it has.
+    const BREAKER_FAILURES = 3;
+    const BREAKER_OPEN = 30;
+    // A tracker file that couldn't be fetched isn't asked for again for this long.
+    const FILE_RETRY = 30;
     const MAX_BODY = 6291456;
     // The collector reads these; everything else, cookies above all, stays here.
     const PASS_HEADERS = array('content-type' => 'Content-Type', 'user-agent' => 'User-Agent',
@@ -103,7 +114,7 @@ class Proxy
         foreach (array('js', 'api') as $kind) {
             if (strncmp($rest, $kind . '/', strlen($kind) + 1) === 0) {
                 $tail = substr($rest, strlen($kind) + 1);
-                $ok = $tail !== '' && strpos($tail, '..') === false && preg_match('#^[A-Za-z0-9/_.-]{1,120}$#', $tail);
+                $ok = $tail !== '' && strpos($tail, '..') === false && preg_match('#^[A-Za-z0-9/_.-]{1,120}$#D', $tail);
                 return $ok ? array($kind, $tail) : array('bad', '');
             }
         }
@@ -127,9 +138,112 @@ class Proxy
         return array('status' => 404, 'headers' => array('Content-Type' => 'text/plain; charset=utf-8'), 'body' => 'Not found');
     }
 
+    // ---- The breaker: shared between requests in APCu, else in a small file
+    // in $dir; with neither, every request tries (and waits TIMEOUT at most).
+
+    private static function apcu()
+    {
+        return function_exists('apcu_enabled') && apcu_enabled();
+    }
+
+    private function stateKey($name)
+    {
+        return 'apx:' . $this->prefix . ':' . $name;
+    }
+
+    private function breaker()
+    {
+        $state = null;
+        if (self::apcu()) {
+            $state = apcu_fetch($this->stateKey('breaker'));
+        } elseif ($this->dir !== '' && is_file($this->dir . '/px-breaker.json')) {
+            $state = json_decode((string) @file_get_contents($this->dir . '/px-breaker.json'), true);
+        }
+        return is_array($state) && isset($state['failures'], $state['open_until'])
+            ? $state : array('failures' => 0, 'open_until' => 0.0);
+    }
+
+    private function saveBreaker(array $state)
+    {
+        if (self::apcu()) {
+            apcu_store($this->stateKey('breaker'), $state, 3600);
+        } elseif ($this->dir !== '' && is_dir($this->dir)) {
+            $file = $this->dir . '/px-breaker.json';
+            $tmp = $file . '.' . getmypid() . '.' . bin2hex(random_bytes(4)) . '.tmp';
+            if (@file_put_contents($tmp, json_encode($state)) === false || !@rename($tmp, $file)) {
+                @unlink($tmp);
+            }
+        }
+    }
+
+    // True while the collector is being left alone.
+    public function resting()
+    {
+        $state = $this->breaker();
+        if ($state['failures'] < self::BREAKER_FAILURES) {
+            return false;
+        }
+        $now = microtime(true);
+        if ($now < $state['open_until']) {
+            return true;
+        }
+        // The pause is over: this request tries, the rest wait for it.
+        $state['open_until'] = $now + self::CONNECT_TIMEOUT + self::TIMEOUT;
+        $this->saveBreaker($state);
+        return false;
+    }
+
+    private function worked()
+    {
+        if ($this->breaker()['failures'] > 0) {
+            $this->saveBreaker(array('failures' => 0, 'open_until' => 0.0));
+        }
+    }
+
+    private function failed()
+    {
+        $state = $this->breaker();
+        $state['failures']++;
+        if ($state['failures'] >= self::BREAKER_FAILURES) {
+            $state['open_until'] = microtime(true) + self::BREAKER_OPEN;
+        }
+        $this->saveBreaker($state);
+    }
+
+    // Whether this tracker file failed to fetch within FILE_RETRY seconds.
+    private function recentlyFailed($rest)
+    {
+        if (self::apcu()) {
+            return apcu_fetch($this->stateKey('failed:' . $rest)) !== false;
+        }
+        $mark = $this->dir === '' ? '' : $this->dir . '/px-' . hash('sha256', $rest) . '.failed';
+        clearstatcache(true, $mark);
+        return $mark !== '' && is_file($mark) && filemtime($mark) > time() - self::FILE_RETRY;
+    }
+
+    private function rememberFailure($rest, $failed)
+    {
+        if (self::apcu()) {
+            if ($failed) {
+                apcu_store($this->stateKey('failed:' . $rest), 1, self::FILE_RETRY);
+            } else {
+                apcu_delete($this->stateKey('failed:' . $rest));
+            }
+            return;
+        }
+        if ($this->dir !== '' && is_dir($this->dir)) {
+            $mark = $this->dir . '/px-' . hash('sha256', $rest) . '.failed';
+            if ($failed) {
+                @touch($mark);
+            } elseif (is_file($mark)) {
+                @unlink($mark);
+            }
+        }
+    }
+
     private function file($rest)
     {
-        if (!preg_match('#^v(\d+(?:\.\d+\.\d+)?)/([a-z]+\.js)$#', $rest, $found) || !in_array($found[2], self::FILES, true)) {
+        if (!preg_match('#^v(\d+(?:\.\d+\.\d+)?)/([a-z]+\.js)$#D', $rest, $found) || !in_array($found[2], self::FILES, true)) {
             return self::notFound();
         }
         $pinned = strpos($found[1], '.') !== false;
@@ -141,24 +255,35 @@ class Proxy
                 $body = @file_get_contents($cache);
             }
         }
-        if ($body === false) {
+        if ($body === false && !$this->recentlyFailed($rest) && !$this->resting()) {
             $answer = $this->send('GET', $this->endpoint . '/' . $rest, null, array());
+            // Remembered only when the collector failed, not for a version
+            // it doesn't have (a 404 is quick): anyone can make up versions,
+            // and the breaker keeps that to a few while it is away.
+            $down = $answer['status'] === 0 || $answer['status'] >= 500;
+            if ($down) {
+                $this->failed();
+            } else {
+                $this->worked();
+            }
+            $this->rememberFailure($rest, $down);
             if ($answer['status'] === 200 && strlen($answer['body']) > 500) {
                 $body = $answer['body'];
                 if ($cache !== '') {
                     // Written beside it and moved into place, so a
                     // half-written file is never served.
-                    $tmp = $cache . '.' . getmypid();
+                    $tmp = $cache . '.' . getmypid() . '.' . bin2hex(random_bytes(4));
                     if (@file_put_contents($tmp, $body) !== false) {
                         @rename($tmp, $cache);
                     } else {
                         @unlink($tmp);
                     }
                 }
-            } elseif ($cache !== '' && is_file($cache)) {
-                // Upstream is unreachable: an old copy beats no tracker at all.
-                $body = @file_get_contents($cache);
             }
+        }
+        if ($body === false && $cache !== '' && is_file($cache)) {
+            // Upstream is unreachable: an old copy beats no tracker at all.
+            $body = @file_get_contents($cache);
         }
         if ($body === false || $body === '') {
             return array('status' => 502, 'headers' => array(), 'body' => '');
@@ -200,7 +325,17 @@ class Proxy
             }
         }
         $url = $this->endpoint . '/collectanalytics/' . $rest . ($query !== '' ? '?' . $query : '');
+        // Left alone for now: answered straight away; the tracker treats a
+        // failed beacon as lost and carries on.
+        if ($this->resting()) {
+            return array('status' => 502, 'headers' => array('Retry-After' => (string) self::BREAKER_OPEN), 'body' => '');
+        }
         $answer = $this->send($method, $url, $method === 'POST' ? (string) $body : null, $out);
+        if ($answer['status'] === 0 || $answer['status'] >= 500) {
+            $this->failed();
+        } else {
+            $this->worked();
+        }
         if ($answer['status'] === 0) {
             // The tracker already treats a failed beacon as lost and carries on.
             return array('status' => 502, 'headers' => array(), 'body' => '');
@@ -225,7 +360,7 @@ class Proxy
                 CURLOPT_CUSTOMREQUEST => $method,
                 CURLOPT_RETURNTRANSFER => true,
                 CURLOPT_TIMEOUT => self::TIMEOUT,
-                CURLOPT_CONNECTTIMEOUT => self::TIMEOUT,
+                CURLOPT_CONNECTTIMEOUT => self::CONNECT_TIMEOUT,
                 CURLOPT_HTTPHEADER => $headers,
                 CURLOPT_HEADERFUNCTION => function ($ch, $line) use (&$result) {
                     $pair = explode(':', $line, 2);

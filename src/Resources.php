@@ -151,7 +151,7 @@ class Resources
             }
             $name = $fields[2];
             if (preg_match('/^(?:loop|ram|zram|sr|fd|dm-|md\d)/', $name)
-                || preg_match('/^(?:(?:sd|vd|xvd|hd)[a-z]+\d+|(?:nvme\d+n\d+|mmcblk\d+)p\d+)$/', $name)) {
+                || preg_match('/^(?:(?:sd|vd|xvd|hd)[a-z]+\d+|(?:nvme\d+n\d+|mmcblk\d+)p\d+)$/D', $name)) {
                 continue;
             }
             if (!is_numeric($fields[5]) || !is_numeric($fields[9])) {
@@ -468,13 +468,20 @@ class Resources
             }
         }
         if ($fields !== null) {
-            @file_put_contents($file, json_encode(array(
+            // Beside it and moved into place, so a request reading it never
+            // sees half a sample.
+            $tmp = $file . '.' . getmypid() . '.' . bin2hex(random_bytes(4)) . '.tmp';
+            if (@file_put_contents($tmp, json_encode(array(
                 'cpu' => $fields,
                 'disk' => $disk,
                 'net' => $net,
                 'at' => $now,
-            )), LOCK_EX);
-            @chmod($file, 0600);
+            ))) !== false) {
+                @chmod($tmp, 0600);
+                if (!@rename($tmp, $file)) {
+                    @unlink($tmp);
+                }
+            }
         } else {
             @touch($file);
         }

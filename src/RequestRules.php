@@ -46,7 +46,7 @@ class RequestRules
             );
             if (isset($rule['methods']) && is_array($rule['methods'])) {
                 foreach ($rule['methods'] as $method) {
-                    if (is_string($method) && preg_match('/^[A-Za-z]{1,10}$/', $method)) {
+                    if (is_string($method) && preg_match('/^[A-Za-z]{1,10}$/D', $method)) {
                         $compiled['methods'][] = strtoupper($method);
                     }
                 }
@@ -77,20 +77,44 @@ class RequestRules
     // ("(a|ab)*"), so a group followed by * + or { holds neither. Backreferences
     // and lookbehind are refused too. The same check as the backend's
     // (backend/services/firewall/requestRules.js), freeRepeats included.
+    //
+    // Group syntax is a list of what is allowed, not of what isn't: only
+    // "(?:", "(?=" and "(?!". PCRE has much more than the subset the rules
+    // are written in -- recursion and subroutine calls ((?R), (?1), (?&x),
+    // \g<1>), named groups and references ((?P<x>, (?<x>, \k<x>, \g{1}),
+    // conditionals ((?(1)...)), atomic groups ("(?" then ">"), inline flags
+    // ((?i)), comments, verbs ((*SKIP), (*UTF)) and \Q...\E quoting -- and
+    // possessive quantifiers (a++, a*+, a?+, {2}+): none of them is in
+    // JavaScript, and a call repeated against an alternation is the same
+    // blow-up as (a+)+.
+    const GROUPS = ':=!';
+    // Escapes that refer to a group or change how the rest is read: \1-\9,
+    // \g (call or reference), \k (named reference), \Q (quoting).
+    const REFERENCE = '/^\\\\[1-9gkQ]/';
+
     public static function safePattern($pattern)
     {
         if (!is_string($pattern) || $pattern === '' || strlen($pattern) > self::MAX_REGEX) {
             return false;
         }
-        if (preg_match('/\\\\[1-9]/', $pattern) || strpos($pattern, '(?<') !== false) {
-            return false;
-        }
         // Per open group: whether anything in it, nested groups too, repeats or branches.
         $open = array();
         $length = strlen($pattern);
+        // Whether the last thing read was a quantifier (* + ? or a {...}'s
+        // closing brace): a + straight after one makes it possessive.
+        $quantifier = false;
         for ($i = 0; $i < $length; $i++) {
             $char = $pattern[$i];
+            $after = $quantifier;
+            $quantifier = strpos('*+?}', $char) !== false;
+            if ($char === '+' && $after) {
+                return false;
+            }
             if ($char === '\\') {
+                $quantifier = false;
+                if (preg_match(self::REFERENCE, substr($pattern, $i, 2))) {
+                    return false;
+                }
                 $i++;
                 continue;
             }
@@ -103,8 +127,15 @@ class RequestRules
             }
             if ($char === '(') {
                 $open[] = false;
+                // A verb ((*SKIP)) or a group that starts with a quantifier.
+                if (isset($pattern[$i + 1]) && $pattern[$i + 1] === '*') {
+                    return false;
+                }
                 // "(?:", "(?=", "(?!": that ? names the kind of group, it repeats nothing.
                 if (isset($pattern[$i + 1]) && $pattern[$i + 1] === '?') {
+                    if (!isset($pattern[$i + 2]) || strpos(self::GROUPS, $pattern[$i + 2]) === false) {
+                        return false;
+                    }
                     $i += 2;
                 }
             } elseif ($char === ')') {
@@ -191,7 +222,7 @@ class RequestRules
             }
             $next = self::literalAt($pattern, $i);
             // Not an atom on its own (preg_match fails): free.
-            if ($atom === null || $next === null || @preg_match(self::DELIM . '^(?:' . $atom . ')$' . self::DELIM . 'i', $next) !== 0) {
+            if ($atom === null || $next === null || @preg_match(self::DELIM . '^(?:' . $atom . ')$' . self::DELIM . 'iD', $next) !== 0) {
                 $free++;
             }
         }
@@ -244,10 +275,43 @@ class RequestRules
         return preg_replace('~/{2,}~', '/', str_replace('\\', '/', strtolower($path)));
     }
 
-    private static function hits(array $section, $raw, $decoded)
+    // The path as a router sees it, besides as it was sent: ";params" taken
+    // off every segment (Tomcat, Jetty, Spring and others drop them), decoded
+    // once, "." and ".." resolved (never above the root), lower-cased, "\"
+    // as "/" and "//" as "/". "/x;y/../admin" and "/x/..%2fadmin" reach
+    // "/admin", so a rule on "/admin" must see that too.
+    public static function routedPath($path)
     {
-        $texts = $decoded === $raw ? array($raw) : array($raw, $decoded);
-        foreach ($texts as $text) {
+        $path = preg_replace('~;[^/]*~', '', (string) $path);
+        $path = self::normalizePath(self::decodeOnce($path));
+        $out = array();
+        $segments = explode('/', $path);
+        $last = count($segments) - 1;
+        foreach ($segments as $i => $segment) {
+            if ($segment === '.' || $segment === '..') {
+                if ($segment === '..' && count($out) > 1) {
+                    array_pop($out);
+                }
+                // "/a/." and "/a/b/.." end in a folder.
+                if ($i === $last) {
+                    $out[] = '';
+                }
+                continue;
+            }
+            $out[] = $segment;
+        }
+        $routed = implode('/', $out);
+        if ($routed === '' || $routed[0] !== '/') {
+            $routed = '/' . ltrim($routed, '/');
+        }
+        return preg_replace('~/{2,}~', '/', $routed);
+    }
+
+    // $texts: the forms of one part (as sent, decoded, as routed); any one
+    // that matches is a match.
+    private static function hits(array $section, ...$texts)
+    {
+        foreach (array_unique($texts) as $text) {
             if (isset($section['exact']) && in_array($text, $section['exact'], true)) {
                 return true;
             }
@@ -292,6 +356,7 @@ class RequestRules
         $rawQuery = strtolower(substr($mark === false ? '' : substr($target, $mark + 1), 0, self::MAX_TEXT));
         $ua = strtolower(substr((string) $userAgent, 0, self::MAX_TEXT));
         $decodedPath = self::normalizePath(substr(self::decodeOnce(substr($mark === false ? $target : substr($target, 0, $mark), 0, self::MAX_TEXT)), 0, self::MAX_TEXT));
+        $routedPath = substr(self::routedPath(substr($mark === false ? $target : substr($target, 0, $mark), 0, self::MAX_TEXT)), 0, self::MAX_TEXT);
         // Lowered again after decoding: %55NION is UNION, and the patterns are lower case.
         $decodedQuery = strtolower(substr(self::decodeOnce($rawQuery), 0, self::MAX_TEXT));
         $upper = strtoupper((string) $method);
@@ -299,7 +364,7 @@ class RequestRules
             if ($rule['methods'] && !in_array($upper, $rule['methods'], true)) {
                 continue;
             }
-            if (isset($rule['path']) && !self::hits($rule['path'], $rawPath, $decodedPath)) {
+            if (isset($rule['path']) && !self::hits($rule['path'], $rawPath, $decodedPath, $routedPath)) {
                 continue;
             }
             if (isset($rule['query']) && !self::hits($rule['query'], $rawQuery, $decodedQuery)) {

@@ -1,6 +1,6 @@
 {
   "name": "analytics-platform/platform",
-  "description": "Firewall, error monitoring and server analytics for your PHP or Laravel site, run from your analytics dashboard.",
+  "description": "Firewall, error monitoring and server analytics for your PHP, Laravel or Symfony site, run from your analytics dashboard.",
   "type": "library",
   "license": "MIT",
   "authors": [
@@ -14,13 +14,18 @@
     "analytics",
     "server-monitoring",
     "laravel",
+    "symfony",
     "security"
   ],
   "require": {
     "php": ">=7.4"
   },
   "suggest": {
-    "ext-apcu": "Needed for the rate limit (or pass your own counter)"
+    "ext-apcu": "Needed for the rate limit (or pass your own counter)",
+    "symfony/framework-bundle": "For AnalyticsPlatform\\Symfony\\PlatformSubscriber (Symfony 6.4 or later)",
+    "symfony/monolog-bundle": "For AnalyticsPlatform\\Symfony\\LogProcessor (the exceptions you log)",
+    "symfony/http-client": "For AnalyticsPlatform\\Symfony\\HttpClientBreadcrumbs (its requests before an error)",
+    "doctrine/dbal": "For AnalyticsPlatform\\Symfony\\QueryMiddleware (3.2 or later: Doctrine's query timings)"
   },
   "autoload": {
     "psr-4": {

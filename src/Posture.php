@@ -380,7 +380,7 @@ class Posture
     private function host()
     {
         $host = function_exists('gethostname') ? (string) gethostname() : '';
-        return preg_match('/^[A-Za-z0-9._-]{1,100}$/', $host) ? $host : 'server';
+        return preg_match('/^[A-Za-z0-9._-]{1,100}$/D', $host) ? $host : 'server';
     }
 
     // Reports now, one process at a time. Returns the checks that failed

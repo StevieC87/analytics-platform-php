@@ -16,6 +16,7 @@ class Crawlers
 {
     const FLUSH_EVERY = 60;
     const MAX_KEYS = 300;
+    const HARD_MAX_KEYS = 400;
     const MAX_ROWS = 500;
     const MAX_IPS_PER_BOT = 5;
     const MAX_PATH = 400;
@@ -186,6 +187,11 @@ class Crawlers
                 if (!isset($rows[$key]) && count($rows) >= self::MAX_KEYS) {
                     $path = '(other)';
                     $key = json_encode(array($minute, $r['b'], $path, $r['s']));
+                }
+                // And past HARD_MAX_KEYS nothing new is kept at all: the
+                // "(other)" rows still split by minute, bot and status.
+                if (!isset($rows[$key]) && count($rows) >= self::HARD_MAX_KEYS) {
+                    continue;
                 }
                 if (!isset($rows[$key])) {
                     $rows[$key] = array(

@@ -12,7 +12,8 @@
 //   the rules' sync interval, by one request at a time (sync.lock).
 // - events.jsonl: what was blocked, appended per request and sent in batches.
 // Rate limits need a counter shared between requests: APCu, or the
-// `counter` option; without either there is no rate limit.
+// `counter` option; without either there is no rate limit. The browser check
+// (Challenge) needs nothing stored: its pass is signed with the site secret.
 // Fails open: no rules, unreadable rules or an unreachable collector let
 // every request through.
 
@@ -38,6 +39,15 @@ class Firewall
         '2a06:98c0::/29', '2c0f:f248::/32',
     );
     private static $cloudflare = null;
+    // IPv4's place in ipKey()'s space: ::ffff:0.0.0.0 to ::ffff:255.255.255.255.
+    const MAPPED_START = '00000000000000000000ffff00000000';
+    const MAPPED_END = '00000000000000000000ffffffffffff';
+    // Files a page load asks for by the dozen: not counted against `rate`
+    // (the agent's nginx limit leaves the same extensions out). An address
+    // already over the limit is still turned away, and one that answered an
+    // error (a flood of made-up /x.css that reaches PHP) is counted after
+    // the response, as the agent counts a static 404.
+    const STATIC_FILES = '/\\.(?:css|js|mjs|map|png|jpe?g|gif|webp|avif|svg|ico|bmp|woff2?|ttf|otf|eot|mp4|webm|ogg|mp3|wav|pdf|wasm)\\z/i';
 
     private $options;
     private $core;
@@ -45,6 +55,8 @@ class Firewall
     private $rules = null;
     private $loaded = false;
     private $reported = false;
+    // The rate counter a static file would have added to: array(name, ttl).
+    private $staticHit = null;
 
     // Options: site_id, secret, endpoint (required); storage (a writable
     // directory; default the system temp directory); trust_proxy (0: the
@@ -53,8 +65,9 @@ class Firewall
     // addresses); mode ('monitor' or 'block', overrides the dashboard);
     // counter (callable($key, $ttl): int, the hit count after
     // adding one); platform (for the dashboard, default 'php'); on_block
-    // (callable($decision), send your own response). $core: shared with the
-    // other modules (Platform passes it).
+    // (callable($decision), send your own response; not for the browser
+    // check, whose page has to be ours to set the pass). $core: shared with
+    // the other modules (Platform passes it).
     public function __construct(array $options, ?Core $core = null)
     {
         $this->options = $options + array(
@@ -80,6 +93,12 @@ class Firewall
         return $this->core->configured();
     }
 
+    // The trust_proxy option, as given.
+    public function trustProxy()
+    {
+        return $this->options['trust_proxy'];
+    }
+
     // Checks the current request and ends it when blocked. Rules and events
     // are synced after the response ($afterResponse false: the caller runs
     // afterResponse() itself, as Platform does).
@@ -93,17 +112,36 @@ class Firewall
         }
         try {
             $path = isset($_SERVER['REQUEST_URI']) ? $_SERVER['REQUEST_URI'] : '';
+            $ip = $this->clientIp();
+            $method = isset($_SERVER['REQUEST_METHOD']) ? $_SERVER['REQUEST_METHOD'] : '';
             $decision = $this->check(
-                $this->clientIp(),
-                isset($_SERVER['REQUEST_METHOD']) ? $_SERVER['REQUEST_METHOD'] : '',
+                $ip,
+                $method,
                 $path,
-                isset($_SERVER['HTTP_USER_AGENT']) ? $_SERVER['HTTP_USER_AGENT'] : ''
+                isset($_SERVER['HTTP_USER_AGENT']) ? $_SERVER['HTTP_USER_AGENT'] : '',
+                isset($_SERVER['HTTP_ACCEPT']) ? $_SERVER['HTTP_ACCEPT'] : '',
+                // Every pass the browser sent, from the raw header: $_COOKIE keeps only the first.
+                Challenge::cookieValues(isset($_SERVER['HTTP_COOKIE']) ? $_SERVER['HTTP_COOKIE'] : '')
             );
+            $page = $decision['rule'] === 'challenge' ? $this->challengePage($ip, $method) : null;
         } catch (\Throwable $e) {
             return;
         }
         if ($decision['action'] !== 'block') {
             return;
+        }
+        if ($page !== null) {
+            if (!headers_sent()) {
+                http_response_code($page['status']);
+                // Replaces any Content-Security-Policy sent before (the
+                // dashboard's security headers): the site's own must not
+                // block the page's script.
+                foreach ($page['headers'] as $name => $value) {
+                    header($name . ': ' . $value);
+                }
+            }
+            echo $page['body'];
+            exit;
         }
         if (is_callable($this->options['on_block'])) {
             call_user_func($this->options['on_block'], $decision);
@@ -124,22 +162,83 @@ class Firewall
     // The visitor's address, per trust_proxy.
     public function clientIp()
     {
-        $direct = isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '';
-        $trust = $this->options['trust_proxy'];
+        return self::clientIpFrom($_SERVER, $this->options['trust_proxy']);
+    }
+
+    // The visitor's address from $server ($_SERVER's keys), per $trust: 0
+    // the connection's address; a number of proxies in X-Forwarded-For;
+    // 'cloudflare' CF-Connecting-IP, believed only from Cloudflare's own
+    // addresses. A hop that isn't an address (a name, "unknown", what a
+    // client wrote) gives the connection's address instead, so the request
+    // is still checked; a port on a hop ("203.0.113.5:54321",
+    // "[2001:db8::1]:443", as Azure's load balancers send) is dropped. Shared
+    // with the WordPress plugin's px.php.
+    //
+    // Count only the proxies that append to X-Forwarded-For. A web server
+    // that already put the visitor in REMOTE_ADDR (Apache's mod_remoteip,
+    // nginx's real_ip in front of PHP-FPM, LiteSpeed's "use client IP in
+    // header") wants 0: mod_remoteip also takes the entries it used out of
+    // the header, so counting them again would read one the visitor wrote.
+    public static function clientIpFrom(array $server, $trust)
+    {
+        $direct = isset($server['REMOTE_ADDR']) ? self::hop($server['REMOTE_ADDR']) : '';
         if ($trust === 'cloudflare') {
-            if (empty($_SERVER['HTTP_CF_CONNECTING_IP']) || !self::fromCloudflare($direct)) {
-                return $direct;
-            }
-            return trim($_SERVER['HTTP_CF_CONNECTING_IP']);
+            $given = isset($server['HTTP_CF_CONNECTING_IP']) ? self::hop($server['HTTP_CF_CONNECTING_IP']) : '';
+            return $given !== '' && self::ipKey($given) !== null && self::fromCloudflare($direct) ? $given : $direct;
         }
         $hops = (int) $trust;
-        if ($hops > 0 && !empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
-            $chain = array_values(array_filter(array_map('trim', explode(',', $_SERVER['HTTP_X_FORWARDED_FOR']))));
+        if ($hops > 0 && !empty($server['HTTP_X_FORWARDED_FOR'])) {
+            $chain = array_values(array_filter(array_map('trim', explode(',', (string) $server['HTTP_X_FORWARDED_FOR'])), 'strlen'));
             if ($chain) {
-                return $chain[max(0, count($chain) - $hops)];
+                $chosen = self::hop($chain[max(0, count($chain) - $hops)]);
+                return self::ipKey($chosen) !== null ? $chosen : $direct;
             }
         }
         return $direct;
+    }
+
+    // One hop as an address: "[v6]:port", "[v6]" and "v4:port" lose the
+    // brackets and the port; anything else is returned trimmed, as it was.
+    public static function hop($text)
+    {
+        $text = trim((string) $text);
+        if ($text !== '' && $text[0] === '[') {
+            $close = strpos($text, ']');
+            return $close === false ? $text : substr($text, 1, $close - 1);
+        }
+        if (preg_match('/^(\d{1,3}(?:\.\d{1,3}){3}):\d{1,5}\z/', $text, $m)) {
+            return $m[1];
+        }
+        return $text;
+    }
+
+    // Who the rate limit, the failed-login count and the bans here are
+    // about: an IPv4 address (::ffff:a.b.c.d as a.b.c.d), or an IPv6
+    // address's /64 as its network ("2001:db8:1:2::/64", compressed and
+    // lower-case), which one machine usually holds whole, as the browser
+    // check binds its pass. Every package builds the shared counter's key
+    // the same way (firewall.md), so a site mixing languages on one Redis
+    // counts a visitor once. Null when it isn't an address.
+    public static function who($ip)
+    {
+        $bin = @inet_pton(self::hop($ip));
+        if ($bin === false) {
+            return null;
+        }
+        if (strlen($bin) === 16 && substr($bin, 0, 12) === str_repeat("\0", 10) . "\xff\xff") {
+            $bin = substr($bin, 12);
+        }
+        if (strlen($bin) === 4) {
+            return inet_ntop($bin);
+        }
+        return inet_ntop(substr($bin, 0, 8) . str_repeat("\0", 8)) . '/64';
+    }
+
+    // Whether a request target asks for a static file (by extension).
+    public static function isStatic($path)
+    {
+        $path = preg_split('/[?#]/', (string) $path, 2)[0];
+        return (bool) preg_match(self::STATIC_FILES, $path);
     }
 
     // Whether the connection came from Cloudflare.
@@ -156,7 +255,102 @@ class Firewall
     }
 
     // array('action' => 'allow' | 'block' | 'monitor', 'rule' => ..., 'status' => ...).
-    public function check($ip, $method = '', $path = '', $userAgent = '')
+    // $accept (the Accept header) and $pass (the __sg_pass cookie, or a list
+    // of up to four from Challenge::cookieValues()) are for
+    // the browser check: rule 'challenge', status 503, answered with
+    // challengePage(). Left out, no request is checked.
+    public function check($ip, $method = '', $path = '', $userAgent = '', $accept = '', $pass = '')
+    {
+        $allow = array('action' => 'allow', 'rule' => '', 'status' => 200);
+        // A worker serving many requests (Octane): nothing of the last one's.
+        $this->staticHit = null;
+        $rules = $this->rules();
+        if (!$rules || empty($rules['enabled'])) {
+            return $allow;
+        }
+        $key = self::ipKey($ip);
+        if ($key === null || self::has($rules['allow'], $key)) {
+            return $allow;
+        }
+        $who = self::who($ip);
+        $rule = $this->addressRule($rules, $key, $who);
+        if ($rule !== '') {
+            // deny, ban, list or shared
+        } elseif (!empty($rules['probes']) && self::isProbe($rules['probes'], $path)) {
+            $rule = 'probe';
+        } elseif (($matched = RequestRules::matchRequest(isset($rules['requests']) ? $rules['requests'] : array(), $method, $path, $userAgent))) {
+            $rule = 'request:' . $matched['id'];
+        } elseif ($rules['rate'] && !self::has(isset($rules['goodbots']) ? $rules['goodbots'] : array(), $key) && $this->overRate($who, $rules['rate'], self::isStatic($path))) {
+            $rule = 'rate';
+        } elseif (!empty($rules['challenge']) && Challenge::needed($rules['challenge'], $this->opt('secret'), $ip, $method, $path,
+            $accept, $pass, null, isset($rules['goodbots']) ? $rules['goodbots'] : array())) {
+            $rule = 'challenge';
+        }
+        if ($rule === '') {
+            return $allow;
+        }
+        $mode = in_array($this->options['mode'], array('monitor', 'block'), true) ? $this->options['mode'] : $rules['mode'];
+        // The browser check is not a mode matter: the collector sends it only
+        // when the site is to be checked.
+        $action = $mode === 'block' || $rule === 'challenge' ? 'block' : 'monitor';
+        // A request rule the dashboard only watches passes even in block mode;
+        // one that blocks also bans the address here, as a flood does.
+        if (isset($matched) && $matched) {
+            $action = $action === 'block' && $matched['action'] === 'block' ? 'block' : 'monitor';
+            if ($action === 'block' && $matched['ban']) {
+                $this->banHere($who, $matched['ban']);
+            }
+        }
+        // Asking for a secret file: banned here (with APCu); the report bans it on the site's other servers.
+        if ($rule === 'probe' && $action === 'block') {
+            $this->banHere($who, $rules['probes']['ban']);
+        }
+        // Over the rate limit: the same, banned here only in block mode.
+        if ($rule === 'rate' && $action === 'block') {
+            $this->banHere($who, isset($rules['ban']) ? $rules['ban'] : 0);
+        }
+        $event = function ($rule, $action) use ($ip, $method, $path, $userAgent) {
+            return array(
+                'at' => gmdate('Y-m-d\TH:i:s\Z'),
+                'ip' => (string) $ip,
+                'rule' => $rule,
+                'action' => $action,
+                'method' => substr((string) $method, 0, 10),
+                'path' => substr(explode('?', (string) $path, 2)[0], 0, 300),
+                'user_agent' => substr((string) $userAgent, 0, 300),
+            );
+        };
+        // A match that is only watched (monitor) still gets the check: firewall.md, step 7.
+        if ($action === 'monitor' && !empty($rules['challenge']) && Challenge::needed($rules['challenge'], $this->opt('secret'), $ip, $method,
+            $path, $accept, $pass, null, isset($rules['goodbots']) ? $rules['goodbots'] : array())) {
+            $this->report($event($rule, $action));
+            $rule = 'challenge';
+            $action = 'block';
+        }
+        $this->report($event($rule, $action));
+        return array('action' => $action, 'rule' => $rule, 'status' => $rule === 'rate' ? 429 : ($rule === 'challenge' ? 503 : 403));
+    }
+
+    // The rules about the address alone (deny, bans, lists, shared): '' when none.
+    private function addressRule(array $rules, $key, $who)
+    {
+        if (self::has($rules['deny'], $key)) {
+            return 'deny';
+        }
+        if ((isset($rules['banned']) && self::has($rules['banned'], $key)) || $this->bannedHere($who)) {
+            return 'ban';
+        }
+        if (self::has($rules['lists'], $key)) {
+            return 'list';
+        }
+        return self::has($rules['shared'], $key) ? 'shared' : '';
+    }
+
+    // The address rules only, for the tracker's own addresses (the proxy): a
+    // denied or banned address gets nothing from us either, but beacons are
+    // never rate-limited, checked or matched against request rules. The same
+    // shape as check().
+    public function checkAddress($ip, $method = '', $path = '', $userAgent = '')
     {
         $allow = array('action' => 'allow', 'rule' => '', 'status' => 200);
         $rules = $this->rules();
@@ -167,43 +361,12 @@ class Firewall
         if ($key === null || self::has($rules['allow'], $key)) {
             return $allow;
         }
-        $rule = '';
-        if (self::has($rules['deny'], $key)) {
-            $rule = 'deny';
-        } elseif ((isset($rules['banned']) && self::has($rules['banned'], $key)) || $this->bannedHere($key)) {
-            $rule = 'ban';
-        } elseif (self::has($rules['lists'], $key)) {
-            $rule = 'list';
-        } elseif (self::has($rules['shared'], $key)) {
-            $rule = 'shared';
-        } elseif (!empty($rules['probes']) && self::isProbe($rules['probes'], $path)) {
-            $rule = 'probe';
-        } elseif (($matched = RequestRules::matchRequest(isset($rules['requests']) ? $rules['requests'] : array(), $method, $path, $userAgent))) {
-            $rule = 'request:' . $matched['id'];
-        } elseif ($rules['rate'] && !self::has(isset($rules['goodbots']) ? $rules['goodbots'] : array(), $key) && $this->overRate($key, $rules['rate'])) {
-            $rule = 'rate';
-        }
+        $rule = $this->addressRule($rules, $key, self::who($ip));
         if ($rule === '') {
             return $allow;
         }
         $mode = in_array($this->options['mode'], array('monitor', 'block'), true) ? $this->options['mode'] : $rules['mode'];
         $action = $mode === 'block' ? 'block' : 'monitor';
-        // A request rule the dashboard only watches passes even in block mode;
-        // one that blocks also bans the address here, as a flood does.
-        if (isset($matched) && $matched) {
-            $action = $action === 'block' && $matched['action'] === 'block' ? 'block' : 'monitor';
-            if ($action === 'block' && $matched['ban']) {
-                $this->banHere($key, $matched['ban']);
-            }
-        }
-        // Asking for a secret file: banned here (with APCu); the report bans it on the site's other servers.
-        if ($rule === 'probe' && $action === 'block') {
-            $this->banHere($key, $rules['probes']['ban']);
-        }
-        // Over the rate limit: the same, banned here only in block mode.
-        if ($rule === 'rate' && $action === 'block') {
-            $this->banHere($key, isset($rules['ban']) ? $rules['ban'] : 0);
-        }
         $this->report(array(
             'at' => gmdate('Y-m-d\TH:i:s\Z'),
             'ip' => (string) $ip,
@@ -213,7 +376,14 @@ class Firewall
             'path' => substr(explode('?', (string) $path, 2)[0], 0, 300),
             'user_agent' => substr((string) $userAgent, 0, 300),
         ));
-        return array('action' => $action, 'rule' => $rule, 'status' => $rule === 'rate' ? 429 : 403);
+        return array('action' => $action, 'rule' => $rule, 'status' => 403);
+    }
+
+    // The browser check's page for this address: array('status', 'headers',
+    // 'body'), for a framework to answer with when check() says 'challenge'.
+    public function challengePage($ip, $method = 'GET')
+    {
+        return Challenge::page($this->opt('secret'), $ip, $method);
     }
 
     // What the rules say now, for a status page: null before the first sync.
@@ -233,6 +403,7 @@ class Firewall
             'fetched' => $rules['fetched'],
             'rate' => $rules['rate'],
             'rate_available' => $this->counterAvailable(),
+            'challenge' => !empty($rules['challenge']),
             'ranges' => $counts,
         );
     }
@@ -253,7 +424,8 @@ class Firewall
         return bin2hex($bin);
     }
 
-    // "1.2.3.0/24" -> array(start, end) as ipKey()s; null when invalid.
+    // "1.2.3.0/24" -> array(start, end) as ipKey()s; null when invalid, or
+    // when an IPv6 range covers all of IPv4 (below).
     public static function range($entry)
     {
         $parts = explode('/', trim((string) $entry));
@@ -284,7 +456,16 @@ class Firewall
             $start .= chr($byte);
             $end .= chr($byte | (~$mask & 0xff));
         }
-        return array(bin2hex($start), bin2hex($end));
+        $start = bin2hex($start);
+        $end = bin2hex($end);
+        // An IPv6 range wide enough to hold all of ::ffff:0:0/96 (::/64,
+        // ::/0) would, with IPv4 kept as ::ffff:a.b.c.d, match every IPv4
+        // visitor: a /64 is one machine in IPv6, but here it is the whole
+        // IPv4 internet. Dropped, whichever list it is in.
+        if (!$v4 && strcmp($start, self::MAPPED_START) <= 0 && strcmp($end, self::MAPPED_END) >= 0) {
+            return null;
+        }
+        return array($start, $end);
     }
 
     // Entries -> sorted, merged ranges.
@@ -364,15 +545,22 @@ class Firewall
     }
 
     // The path without its query string, lower-cased, with "//" as "/".
+    // Also as the router would see it (RequestRules::routedPath(): no
+    // ";params", "." and ".." resolved, decoded once), so "/x;y/../.env" is
+    // the probe "/.env" too.
     public static function isProbe(array $probes, $path)
     {
-        $path = strtolower(preg_replace('#/{2,}#', '/', explode('?', (string) $path, 2)[0]));
-        if (isset($probes['exact'][$path])) {
-            return true;
-        }
-        foreach ($probes['prefix'] as $prefix) {
-            if (strpos($path, $prefix) === 0) {
+        $raw = explode('?', (string) $path, 2)[0];
+        $plain = strtolower(preg_replace('#/{2,}#', '/', $raw));
+        $routed = RequestRules::routedPath(substr($raw, 0, RequestRules::MAX_TEXT));
+        foreach ($plain === $routed ? array($plain) : array($plain, $routed) as $text) {
+            if (isset($probes['exact'][$text])) {
                 return true;
+            }
+            foreach ($probes['prefix'] as $prefix) {
+                if (strpos($text, $prefix) === 0) {
+                    return true;
+                }
             }
         }
         return false;
@@ -414,6 +602,8 @@ class Firewall
             'probes' => self::compileProbes(isset($data['probes']) ? $data['probes'] : null),
             // Virtual patching: rules that match the request, not the address.
             'requests' => RequestRules::compile(isset($data['requests']) ? $data['requests'] : null),
+            // The browser check (flood protection): null unless the site is to be checked.
+            'challenge' => Challenge::compile(isset($data['challenge']) ? $data['challenge'] : null),
         );
         foreach (self::RULES as $list) {
             $rules[$list] = self::compileList(isset($data[$list]) ? $data[$list] : array());
@@ -451,7 +641,9 @@ class Firewall
         }
         @touch($lockFile);
         $ok = false;
-        $headers = array();
+        // What this server runs (the package's firewall and its browser
+        // check) and its name, shown per server on the dashboard.
+        $headers = array('X-Firewall-Layers: app check', 'X-Server-Name: ' . $this->serverName());
         if ($rules && $rules['etag'] !== '' && !$force) {
             $headers[] = 'If-None-Match: ' . $rules['etag'];
         }
@@ -472,6 +664,17 @@ class Firewall
         return $ok;
     }
 
+    // The server_name option, else the host name, as the check-in sends it;
+    // 100 characters at most, on one line.
+    public function serverName()
+    {
+        $name = $this->opt('server_name');
+        if (empty($name)) {
+            $name = function_exists('gethostname') ? (string) gethostname() : '';
+        }
+        return substr(trim(preg_replace('/[\x00-\x1f\x7f]+/', ' ', (string) $name)), 0, 100);
+    }
+
     // ---- Rate limit -------------------------------------------------------
 
     private function counterAvailable()
@@ -489,15 +692,16 @@ class Firewall
         return function_exists('apcu_enabled') && apcu_enabled();
     }
 
-    private function bannedHere($key)
+    // $who: who() of the address (an IPv4 address or an IPv6 /64).
+    private function bannedHere($who)
     {
-        return $this->apcu() && apcu_fetch('afw:ban:' . $this->opt('site_id') . ':' . $key) !== false;
+        return $who !== null && $this->apcu() && apcu_fetch('afw:ban:' . $this->opt('site_id') . ':' . $who) !== false;
     }
 
-    private function banHere($key, $seconds)
+    private function banHere($who, $seconds)
     {
-        if ($seconds > 0 && $this->apcu()) {
-            apcu_store('afw:ban:' . $this->opt('site_id') . ':' . $key, 1, (int) $seconds);
+        if ($who !== null && $seconds > 0 && $this->apcu()) {
+            apcu_store('afw:ban:' . $this->opt('site_id') . ':' . $who, 1, (int) $seconds);
         }
     }
 
@@ -515,12 +719,13 @@ class Firewall
                 return;
             }
             $login = $rules && !empty($rules['login']) ? $rules['login'] : null;
+            $who = self::who($ip);
             if ($login && $this->apcu()) {
-                $name = 'afw:login:' . $this->opt('site_id') . ':' . $key;
+                $name = 'afw:login:' . $this->opt('site_id') . ':' . $who;
                 apcu_add($name, 0, max(60, $login['window']));
                 if ((int) apcu_inc($name) >= $login['limit']) {
                     apcu_delete($name);
-                    $this->banHere($key, $login['ban']);
+                    $this->banHere($who, $login['ban']);
                 }
             }
             $this->report(array(
@@ -532,20 +737,54 @@ class Firewall
         }
     }
 
-    private function overRate($key, array $rate)
+    // Whether $who is over the limit. A static file isn't counted (it is
+    // only compared with the count so far, where the counter can tell it
+    // without adding one); countStatic() adds it after the response when it
+    // answered an error.
+    private function overRate($who, array $rate, $static = false)
     {
+        if ($who === null) {
+            return false;
+        }
         $window = (int) floor(time() / $rate['window']);
-        $name = 'afw:' . $this->opt('site_id') . ':' . $key . ':' . $window;
+        $name = 'afw:' . $this->opt('site_id') . ':' . $who . ':' . $window;
         $ttl = $rate['window'] * 2;
-        if (is_callable($this->options['counter'])) {
+        if ($static) {
+            $this->staticHit = array($name, $ttl);
+            $hits = !is_callable($this->options['counter']) && $this->apcu() ? (int) apcu_fetch($name) : 0;
+        } elseif (is_callable($this->options['counter'])) {
             $hits = (int) call_user_func($this->options['counter'], $name, $ttl);
-        } elseif (function_exists('apcu_enabled') && apcu_enabled()) {
+        } elseif ($this->apcu()) {
             apcu_add($name, 0, $ttl);
             $hits = (int) apcu_inc($name);
         } else {
             return false;
         }
         return $hits > $rate['limit'];
+    }
+
+    // After the response: a static file that answered an error (404, 5xx)
+    // counts against the rate limit after all, so a flood of made-up file
+    // names that each boot the whole app is still limited. $status: the
+    // response's (default http_response_code()).
+    public function countStatic($status = null)
+    {
+        $hit = $this->staticHit;
+        $this->staticHit = null;
+        $status = $status === null ? (int) http_response_code() : (int) $status;
+        if ($hit === null || $status < 400) {
+            return;
+        }
+        try {
+            if (is_callable($this->options['counter'])) {
+                call_user_func($this->options['counter'], $hit[0], $hit[1]);
+            } elseif ($this->apcu()) {
+                apcu_add($hit[0], 0, $hit[1]);
+                apcu_inc($hit[0]);
+            }
+        } catch (\Throwable $e) {
+            // never break the site
+        }
     }
 
     // ---- Events -----------------------------------------------------------
@@ -585,6 +824,18 @@ class Firewall
     public function afterResponse()
     {
         try {
+            $this->core->within(Core::DEADLINE, function () {
+                $this->syncAndFlush();
+            });
+        } catch (\Throwable $e) {
+            // never break the site
+        }
+    }
+
+    private function syncAndFlush()
+    {
+        try {
+            $this->countStatic();
             $rules = $this->rules();
             $dueSync = !$rules || time() >= $rules['fetched'] + $rules['sync'];
             $dueFlush = $this->reported || $this->core->waiting('events');

@@ -12,7 +12,7 @@ namespace AnalyticsPlatform;
 
 class Core
 {
-    const VERSION = '0.3.3';
+    const VERSION = '0.3.4';
     const TIMEOUT = 4;
     const MIN_SYNC = 30;
     const RETRY = 60;
@@ -20,6 +20,14 @@ class Core
     // many bytes of them, and this many resent per run.
     const RETRY_MAX = 2000000;
     const RESEND = 20;
+    // Everything sent after a response shares one deadline (within()), so
+    // a collector that doesn't answer can't hold a PHP worker for minutes,
+    // or outlast a container's grace period: each send waits at most what's
+    // left, none starts after it, and what wasn't sent waits in its spool.
+    const DEADLINE = 5;
+    // http()'s status when the body couldn't be written as JSON: nothing was
+    // sent, and sending it again would fail the same way.
+    const UNSENDABLE = -1;
 
     public $options;
     // Appended to the User-Agent, e.g. " (no-rate)" when the firewall can't count.
@@ -28,6 +36,7 @@ class Core
     private $legacyDir = '';
     private $switches = null;
     private $loaded = array();
+    private $deadline = null;
 
     // Options: site_id, secret, endpoint (required); storage (a writable
     // directory; default the system temp directory); platform (for the
@@ -50,6 +59,12 @@ class Core
         // guessed from outside.
         $base = rtrim($this->options['storage'], '/\\');
         $this->dir = $base . '/' . ($id === '' ? '' : $id . '-' . substr(hash('sha256', $id . '|' . (string) $this->opt('secret')), 0, 16));
+        // The folder itself, for a caller that has it but not the secret
+        // (the WordPress plugin's px.php, which checks the firewall's rules).
+        if (is_string($this->opt('dir')) && $this->opt('dir') !== '') {
+            $this->dir = rtrim($this->opt('dir'), '/\\');
+            return;
+        }
         // Where it used to be, when the name was guessable.
         $this->legacyDir = $id === '' ? '' : $base . '/' . $id;
     }
@@ -73,6 +88,54 @@ class Core
         ), '', '&', PHP_QUERY_RFC3986);
     }
 
+    // Runs $fn with every send inside $seconds from now (nested: the
+    // earlier end wins). Returns what $fn returns.
+    public function within($seconds, callable $fn)
+    {
+        $before = $this->deadline;
+        $ends = microtime(true) + $seconds;
+        $this->deadline = $before === null ? $ends : min($before, $ends);
+        try {
+            return $fn();
+        } finally {
+            $this->deadline = $before;
+        }
+    }
+
+    // Seconds left before the deadline, or null when there is none.
+    public function timeLeft()
+    {
+        return $this->deadline === null ? null : max(0.0, $this->deadline - microtime(true));
+    }
+
+    // How long one send may wait: $normal, cut to what's left of a deadline;
+    // null once it has passed (nothing more is sent).
+    public function sendTimeout($normal)
+    {
+        $left = $this->timeLeft();
+        if ($left === null) {
+            return (float) $normal;
+        }
+        return $left < 0.05 ? null : min((float) $normal, $left);
+    }
+
+    // A value as plain arrays and scalars that json_encode() can always
+    // write, worked out when it is handed to us rather than when it is sent:
+    // a resource, NAN or a recursive object would otherwise fail the whole
+    // batch it is in. Bad UTF-8 is replaced; what still can't be written
+    // becomes null. Null for nothing at all.
+    public static function plain($value)
+    {
+        if ($value === null || is_string($value) || is_int($value) || is_bool($value)) {
+            return $value;
+        }
+        $json = json_encode($value, JSON_INVALID_UTF8_SUBSTITUTE | JSON_PRESERVE_ZERO_FRACTION);
+        if ($json === false) {
+            $json = json_encode($value, JSON_INVALID_UTF8_SUBSTITUTE | JSON_PRESERVE_ZERO_FRACTION | JSON_PARTIAL_OUTPUT_ON_ERROR);
+        }
+        return $json === false ? null : json_decode($json, true);
+    }
+
     public function opt($key)
     {
         return isset($this->options[$key]) ? $this->options[$key] : null;
@@ -80,7 +143,7 @@ class Core
 
     public function configured()
     {
-        return preg_match('/^[a-f0-9]{24}$/i', (string) $this->opt('site_id')) && $this->opt('secret') && $this->opt('endpoint');
+        return preg_match('/^[a-f0-9]{24}$/Di', (string) $this->opt('site_id')) && $this->opt('secret') && $this->opt('endpoint');
     }
 
     public function dir()
@@ -124,7 +187,7 @@ class Core
     public function writePhp($name, $value)
     {
         $file = $this->dir . '/' . $name;
-        $tmp = $file . '.' . getmypid() . '.tmp';
+        $tmp = $file . '.' . getmypid() . '.' . bin2hex(random_bytes(4)) . '.tmp';
         $php = "<?php\n// Written by the analytics package; rewritten on every sync.\nreturn " . var_export($value, true) . ";\n";
         if (@file_put_contents($tmp, $php, LOCK_EX) === false || !@rename($tmp, $file)) {
             @unlink($tmp);
@@ -177,6 +240,20 @@ class Core
         return $this->isOn('maintenance') && isset($switches['maintenance']) && is_array($switches['maintenance']) ? $switches['maintenance'] : array('on' => false);
     }
 
+    // A dashboard header is added only when it is well formed: a token name
+    // that isn't one of the headers that frame the response (a Content-Length
+    // or Transfer-Encoding of ours would desync it, a Set-Cookie or
+    // Content-Type would change what it is), and a value of visible ASCII,
+    // spaces and tabs, so no line break, control character or byte a server
+    // rejects gets through.
+    public static function safeHeader($pair)
+    {
+        return is_array($pair) && count($pair) === 2 && isset($pair[0], $pair[1]) && is_string($pair[0]) && is_string($pair[1])
+            && preg_match('/^[A-Za-z][A-Za-z0-9-]{0,63}\z/', $pair[0])
+            && !in_array(strtolower($pair[0]), array('content-length', 'transfer-encoding', 'connection', 'set-cookie', 'content-type'), true)
+            && strlen($pair[1]) <= 4000 && preg_match('/^[\x20-\x7e\t]*\z/', $pair[1]);
+    }
+
     // The security headers picked on the dashboard, when the module is on.
     public function securityHeaders()
     {
@@ -217,11 +294,9 @@ class Core
                 $switches['modules'] = $data['modules'];
                 $switches['flags'] = isset($data['flags']) && is_array($data['flags']) ? $data['flags'] : array();
                 $switches['maintenance'] = isset($data['maintenance']) && is_array($data['maintenance']) ? $data['maintenance'] : array('on' => false);
-                // Only well-formed headers (no line breaks can get through).
                 $switches['headers'] = array();
                 foreach (isset($data['headers']) && is_array($data['headers']) ? $data['headers'] : array() as $pair) {
-                    if (is_array($pair) && count($pair) === 2 && is_string($pair[0]) && is_string($pair[1])
-                        && preg_match('/^[A-Za-z][A-Za-z0-9-]{0,63}$/', $pair[0]) && !preg_match('/[\r\n]/', $pair[1]) && strlen($pair[1]) <= 4000) {
+                    if (self::safeHeader($pair)) {
                         $switches['headers'][] = array($pair[0], $pair[1]);
                     }
                 }
@@ -247,18 +322,26 @@ class Core
     public function append($name, array $row, $max)
     {
         $file = $this->dir . '/' . $name . '.jsonl';
-        clearstatcache(true, $file);
-        if (is_file($file) && filesize($file) > $max) {
+        $line = json_encode($row, JSON_INVALID_UTF8_SUBSTITUTE | JSON_PARTIAL_OUTPUT_ON_ERROR);
+        if ($line === false) {
             return false;
         }
-        return @file_put_contents($file, json_encode($row, JSON_INVALID_UTF8_SUBSTITUTE) . "\n", FILE_APPEND | LOCK_EX) !== false;
+        $line .= "\n";
+        clearstatcache(true, $file);
+        // The line counts too: the file never grows past $max.
+        if ((is_file($file) ? filesize($file) : 0) + strlen($line) > $max) {
+            return false;
+        }
+        return @file_put_contents($file, $line, FILE_APPEND | LOCK_EX) !== false;
     }
 
     // Whether anything is waiting to be sent, new or to be resent.
     public function waiting($name)
     {
         clearstatcache();
-        return is_file($this->dir . '/' . $name . '.jsonl') || is_file($this->dir . '/' . $name . '.retry.jsonl');
+        $base = $this->dir . '/' . $name;
+        return is_file($base . '.jsonl') || is_file($base . '.retry.jsonl')
+            || is_file($base . '.jsonl.sending') || is_file($base . '.retry.jsonl.sending');
     }
 
     // Whether the last send was at least $every seconds ago.
@@ -284,15 +367,25 @@ class Core
         @touch($this->dir . '/' . $name . '.lock');
         try {
             $this->resend($name);
+            list($lines, $sending) = $this->take($this->dir . '/' . $name . '.jsonl');
             $rows = array();
-            foreach ($this->take($this->dir . '/' . $name . '.jsonl') as $line) {
+            foreach ($lines as $line) {
                 $row = json_decode($line, true);
                 if (is_array($row)) {
                     $rows[] = $row;
                 }
             }
-            if ($rows) {
-                $send($rows);
+            try {
+                if ($rows) {
+                    $send($rows);
+                }
+            } finally {
+                // Only now: a request killed while sending leaves the file to
+                // be sent again (take()) rather than losing what it held.
+                // A batch $send couldn't deliver is in the retry spool by now.
+                if ($sending !== '') {
+                    @unlink($sending);
+                }
             }
         } finally {
             flock($lock, LOCK_UN);
@@ -306,18 +399,27 @@ class Core
     public function post($name, $path, array $body, $auth = 'body')
     {
         $res = $this->http('POST', $path, $body, array(), $auth);
-        if ($res['status'] === 0 || $res['status'] === 429 || $res['status'] >= 500) {
+        if (self::retryable($res['status']) && $this->ensureDir()) {
             $this->append($name . '.retry', array('path' => $path, 'auth' => $auth, 'body' => $body), self::RETRY_MAX);
         }
         return $res;
     }
 
+    // Whether a batch is worth sending again: no answer, or the collector
+    // was busy. Not a 4xx (resending won't make it acceptable), nor one that
+    // couldn't be written as JSON.
+    public static function retryable($status)
+    {
+        return $status === 0 || $status === 429 || $status >= 500;
+    }
+
     // Sends what earlier runs couldn't, oldest first. Once one fails the
-    // collector is still away, so the rest go back unsent.
+    // collector is still away (or the deadline has passed), so the rest go
+    // back unsent.
     private function resend($name)
     {
         $file = $this->dir . '/' . $name . '.retry.jsonl';
-        $lines = $this->take($file);
+        list($lines, $sending) = $this->take($file);
         foreach ($lines as $i => $line) {
             $batch = json_decode($line, true);
             if (!is_array($batch) || !isset($batch['path'], $batch['body']) || !is_array($batch['body'])
@@ -326,26 +428,37 @@ class Core
             }
             $auth = isset($batch['auth']) && $batch['auth'] === 'bearer' ? 'bearer' : 'body';
             $res = $i < self::RESEND ? $this->http('POST', $batch['path'], $batch['body'], array(), $auth) : array('status' => 0);
-            if ($res['status'] === 0 || $res['status'] === 429 || $res['status'] >= 500) {
+            if (self::retryable($res['status'])) {
                 $rest = array_slice($lines, $i);
                 @file_put_contents($file, implode("\n", $rest) . "\n", FILE_APPEND | LOCK_EX);
-                return;
+                break;
             }
+        }
+        if ($sending !== '') {
+            @unlink($sending);
         }
     }
 
-    // The lines of a spool file, which is removed: renamed first, so lines
-    // other requests append meanwhile start a new file rather than being lost.
+    // The lines of a spool file, and the name it was moved to while they are
+    // sent ('' when there was none): renamed first, so lines other requests
+    // append meanwhile start a new file rather than being lost. The caller
+    // removes the moved file once it is done with it, so a request killed
+    // while sending leaves it behind; only one request drains a spool at a
+    // time (drain()'s lock), so the next one to get the lock finds it and
+    // sends it again, before taking anything new. Some of it may have reached
+    // the collector already: a copy beats a loss.
     private function take($file)
     {
-        $sending = $file . '.' . getmypid() . '.sending';
-        clearstatcache(true, $file);
-        if (!is_file($file) || !@rename($file, $sending)) {
-            return array();
+        $sending = $file . '.sending';
+        clearstatcache(true, $sending);
+        if (!is_file($sending)) {
+            clearstatcache(true, $file);
+            if (!is_file($file) || !@rename($file, $sending)) {
+                return array(array(), '');
+            }
         }
         $lines = file($sending, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: array();
-        @unlink($sending);
-        return $lines;
+        return array($lines, $sending);
     }
 
     // ---- HTTP ---------------------------------------------------------------
@@ -358,13 +471,24 @@ class Core
         if (!$this->configured()) {
             return $result;
         }
+        // Past the deadline nothing is sent: status 0, so post() keeps it.
+        $timeout = $this->sendTimeout(self::TIMEOUT);
+        if ($timeout === null) {
+            return $result;
+        }
         if ($body !== null) {
             if ($auth === 'body') {
                 $body = array('site_id' => (string) $this->opt('site_id'), 'sitesecret' => (string) $this->opt('secret')) + $body;
             }
             // A name that isn't UTF-8 (a file, a path) has its bad bytes
             // replaced rather than failing the encoding and losing the whole body.
-            $body = json_encode($body, JSON_INVALID_UTF8_SUBSTITUTE);
+            $body = json_encode($body, JSON_INVALID_UTF8_SUBSTITUTE | JSON_PRESERVE_ZERO_FRACTION);
+            if ($body === false) {
+                // Not a network failure: nothing went out, and resending
+                // can't help, so it isn't kept.
+                $result['status'] = self::UNSENDABLE;
+                return $result;
+            }
             $headers[] = 'Content-Type: application/json';
         }
         if ($auth === 'bearer') {
@@ -377,8 +501,9 @@ class Core
             curl_setopt_array($ch, array(
                 CURLOPT_CUSTOMREQUEST => $method,
                 CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_TIMEOUT => self::TIMEOUT,
-                CURLOPT_CONNECTTIMEOUT => self::TIMEOUT,
+                CURLOPT_TIMEOUT_MS => (int) ceil($timeout * 1000),
+                CURLOPT_CONNECTTIMEOUT_MS => (int) ceil($timeout * 1000),
+                CURLOPT_NOSIGNAL => true,
                 CURLOPT_HTTPHEADER => $headers,
                 CURLOPT_HEADERFUNCTION => function ($ch, $line) use (&$result) {
                     $parts = explode(':', $line, 2);
@@ -401,7 +526,7 @@ class Core
             'method' => $method,
             'header' => implode("\r\n", $headers),
             'content' => $body === null ? '' : $body,
-            'timeout' => self::TIMEOUT,
+            'timeout' => $timeout,
             'ignore_errors' => true,
         )));
         $response = @file_get_contents($url, false, $context);

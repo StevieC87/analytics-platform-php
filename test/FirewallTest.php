@@ -46,5 +46,15 @@ if (is_file($shared)) {
     check('the ranges are the shared list', is_array($list) && $list['ranges'] === Firewall::CLOUDFLARE);
 }
 
+// An IPv6 range that holds all of ::ffff:0:0/96 would match every IPv4
+// visitor (IPv4 is kept as ::ffff:a.b.c.d): dropped from any list.
+foreach (array('::/64', '::ffff:0:0/64', '::/0', '::ffff:0:0/96', '::/8') as $wide) {
+    check("$wide is refused", Firewall::range($wide) === null);
+    check("$wide matches no IPv4 visitor", !Firewall::inList(Firewall::compileList(array($wide)), Firewall::ipKey('203.0.113.9')));
+}
+check('an IPv4 range written as IPv6 still counts', Firewall::inList(Firewall::compileList(array('::ffff:203.0.113.0/120')), Firewall::ipKey('203.0.113.9')));
+check('an ordinary IPv6 /64 still counts', Firewall::inList(Firewall::compileList(array('2001:db8:0:1::/64')), Firewall::ipKey('2001:db8:0:1::9')));
+check('and a plain IPv4 range', Firewall::inList(Firewall::compileList(array('203.0.113.0/24', '::/64')), Firewall::ipKey('203.0.113.9')));
+
 echo ($failed ? "FAILED" : "OK") . ": $checked checks, $failed failed\n";
 exit($failed ? 1 : 0);

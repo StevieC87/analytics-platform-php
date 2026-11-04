@@ -4,7 +4,8 @@
 // keys there) and, unless 'global' is off, puts its middleware first in
 // every request. Errors Laravel reports go to the Errors report too, and
 // with 'capture_logs' the exceptions your code logs. Rate
-// limits count in the app's cache store, so APCu isn't needed.
+// limits count in the app's cache store, so APCu isn't needed. Every database
+// query is timed for Server speed (QueryExecuted, what DB::listen hears).
 //
 // In your code: app(AnalyticsPlatform\Platform::class)->track('purchase', [...]).
 
@@ -12,6 +13,7 @@ namespace AnalyticsPlatform\Laravel;
 
 use AnalyticsPlatform\Firewall;
 use AnalyticsPlatform\Platform;
+use AnalyticsPlatform\Queries;
 use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Contracts\Http\Kernel;
 use Illuminate\Support\Facades\Cache;
@@ -43,6 +45,7 @@ class FirewallServiceProvider extends ServiceProvider
                 'errors' => (bool) $config['errors'],
                 'analytics' => (bool) $config['analytics'],
                 'performance' => (bool) ($config['performance'] ?? true),
+                'queries' => (bool) ($config['queries'] ?? true),
                 // composer.lock is in the app's root.
                 'inventory' => ($config['inventory'] ?? true) ? array('root' => base_path()) : false,
                 // Only the folder the web server serves is walked.
@@ -60,6 +63,8 @@ class FirewallServiceProvider extends ServiceProvider
         $this->publishes(array(__DIR__ . '/config.php' => config_path('analytics-firewall.php')), 'analytics-firewall');
         // Before the return below: a queue job's calls are steps of its trail too.
         $this->breadcrumbs();
+        // And its queries are its own.
+        $this->queries();
         if ($this->app->runningInConsole()) {
             $this->queueJobs();
             return;
@@ -137,6 +142,51 @@ class FirewallServiceProvider extends ServiceProvider
         }
     }
 
+    // Database queries (sdk/protocols/queries.md): QueryExecuted is what
+    // DB::listen() listens for, on every connection, so this is DB::listen
+    // without making a connection first. Its time is Laravel's own, in ms.
+    // MongoDB connections (mongodb/laravel-mongodb) are left to the mongodb
+    // extension's subscriber (Queries), which times the same commands.
+    //
+    // Laravel announces no failed query, so a failure is counted when its
+    // QueryException is reported, with no time (0 ms): one your code catches
+    // and doesn't report isn't counted at all.
+    private function queries()
+    {
+        $config = $this->app['config'];
+        if (!$config->get('analytics-firewall.performance', true) || !$config->get('analytics-firewall.queries', true)) {
+            return;
+        }
+        $platform = null;
+        $events = $this->app['events'];
+        $events->listen('Illuminate\\Database\\Events\\QueryExecuted', function ($e) use (&$platform) {
+            $driver = isset($e->connection) && is_object($e->connection) && method_exists($e->connection, 'getDriverName')
+                ? (string) $e->connection->getDriverName() : '';
+            if ($driver === 'mongodb') {
+                return;
+            }
+            $platform = $platform ?: $this->app->make(Platform::class);
+            $platform->recordQuery(Queries::databaseOfDriver($driver), (string) $e->sql, (float) $e->time);
+        });
+        $handler = $this->app->make(ExceptionHandler::class);
+        if (method_exists($handler, 'reportable')) {
+            $handler->reportable(function (\Throwable $error) use ($config) {
+                if (!$error instanceof \Illuminate\Database\QueryException) {
+                    return;
+                }
+                $name = isset($error->connectionName) ? (string) $error->connectionName : (string) $config->get('database.default');
+                $driver = (string) $config->get('database.connections.' . $name . '.driver');
+                if ($driver !== 'mongodb') {
+                    $this->app->make(Platform::class)->recordQuery(Queries::databaseOfDriver($driver), (string) $error->getSql(), 0.0, true);
+                }
+            });
+        }
+        // Octane serves many requests from one process: each starts afresh.
+        $events->listen('Laravel\\Octane\\Events\\RequestReceived', function () {
+            $this->app->make(Platform::class)->beginRequest();
+        });
+    }
+
     // Queue workers (queue:work): each job is timed and its errors sent with
     // the job's name as their route, after every job, since a worker never
     // reaches the end of a request.
@@ -171,7 +221,18 @@ class FirewallServiceProvider extends ServiceProvider
             'method' => $request ? $request->method() : '',
             'path' => $request ? '/' . ltrim($request->path(), '/') : '',
             'route' => $route ? '/' . ltrim($route, '/') : '',
-            'session_id' => Platform::sessionIdFromRequest(),
+            'session_id' => self::sessionOf($request),
         );
+    }
+
+    // The visitor's session from the request itself, not $_SERVER/$_COOKIE,
+    // which under Octane are the worker's.
+    private static function sessionOf($request)
+    {
+        if (!$request) {
+            return '';
+        }
+        $value = (string) ($request->headers->get('X-Analytics-Session') ?: $request->cookies->get(Platform::SESSION_COOKIE));
+        return preg_match('/^[0-9a-f-]{36}$/Di', $value) ? strtolower($value) : '';
     }
 }

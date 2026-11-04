@@ -22,6 +22,9 @@ return [
     'capture_logs' => env('ANALYTICS_CAPTURE_LOGS', false),
     'analytics' => env('ANALYTICS_SERVER_EVENTS', true),
     'performance' => env('ANALYTICS_PERFORMANCE', true),
+    // With it, every database query's time (Health → Server speed → Queries),
+    // its values taken out before anything is counted.
+    'queries' => env('ANALYTICS_QUERIES', true),
     // The Composer packages and PHP version, once a day, for the Security check.
     'inventory' => env('ANALYTICS_INVENTORY', true),
     // How the server is set up, once a day, for the Security check: php.ini

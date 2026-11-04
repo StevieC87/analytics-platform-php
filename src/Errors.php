@@ -21,6 +21,12 @@ class Errors
     const RESEND_EVERY = 60;
     // Steps kept in the trail of a request or job.
     const CRUMB_MAX = 15;
+    // Characters of a message kept: a message can carry a whole request
+    // body or SQL dump, and every error is held in memory and on disk.
+    const MAX_MESSAGE = 2000;
+    // What a write to a visitor who has gone away fails with: the visitor
+    // closed the tab, not a fault in the site.
+    const GONE = '/broken pipe|connection reset|errno=(?:32|104)\b|ECONNRESET|EPIPE/i';
 
     private $core;
     private $options;
@@ -89,7 +95,7 @@ class Errors
         }
         $this->fatalRead = true;
         $this->add(array(
-            'message' => (string) $last['message'],
+            'message' => self::cut((string) $last['message']),
             'error_type' => 'FatalError',
             'stack' => '  File "' . $this->relative($last['file']) . '", line ' . (int) $last['line'] . ', in (fatal error)',
             'kind' => 'error',
@@ -126,7 +132,30 @@ class Errors
         foreach (array_reverse($frames) as $frame) {
             $lines[] = '  File "' . $this->relative($frame[0]) . '", line ' . (int) $frame[1] . ', in ' . $frame[2];
         }
-        return "Traceback (most recent call last):\n" . implode("\n", $lines) . "\n" . get_class($error) . ': ' . $error->getMessage();
+        return "Traceback (most recent call last):\n" . implode("\n", $lines) . "\n" . get_class($error) . ': ' . self::cut($error->getMessage());
+    }
+
+    // A message cut to MAX_MESSAGE characters (bytes where mbstring is missing).
+    public static function cut($text)
+    {
+        $text = (string) $text;
+        if (strlen($text) <= self::MAX_MESSAGE) {
+            return $text;
+        }
+        return function_exists('mb_substr') ? mb_substr($text, 0, self::MAX_MESSAGE, 'UTF-8') : substr($text, 0, self::MAX_MESSAGE);
+    }
+
+    // Whether an error is only the visitor having gone away (a write to a
+    // closed connection): PHP says so with connection_aborted(), and the
+    // error names a broken pipe or a reset. Not reported: it isn't the
+    // site's fault, and it would show as a 500 that no one saw.
+    public static function clientGone($error)
+    {
+        if (!(function_exists('connection_aborted') && connection_aborted())) {
+            return false;
+        }
+        $message = $error instanceof \Throwable ? $error->getMessage() : (string) $error;
+        return (bool) preg_match(self::GONE, $message);
     }
 
     // The request's route pattern, as Server speed names it (Platform::setRoute).
@@ -204,13 +233,16 @@ class Errors
         }
         try {
             $isError = $error instanceof \Throwable;
+            if (self::clientGone($error)) {
+                return;
+            }
             $request = $request === null ? $this->requestFields() : $request;
             if ($isError && $this->seen->contains($error)) {
                 $this->upgrade($error, $request, $status, $kind);
                 return;
             }
             $event = array(
-                'message' => $isError ? ($error->getMessage() !== '' ? $error->getMessage() : get_class($error)) : (string) $error,
+                'message' => self::cut($isError ? ($error->getMessage() !== '' ? $error->getMessage() : get_class($error)) : (string) $error),
                 'error_type' => $isError ? (new \ReflectionClass($error))->getShortName() : 'Error',
                 'stack' => $isError ? $this->stack($error) : '',
                 'kind' => $kind,
@@ -255,9 +287,9 @@ class Errors
             }
         }
         if (is_callable($this->options['before_send'])) {
-            $event = call_user_func($this->options['before_send'], $event, $error);
+            $event = Core::plain(call_user_func($this->options['before_send'], $event, $error));
         }
-        if ($event) {
+        if ($event && is_array($event)) {
             $this->queue[$key] = $event;
         } else {
             unset($this->queue[$key]);
@@ -280,8 +312,10 @@ class Errors
             $event['breadcrumbs'] = $this->breadcrumbs();
         }
         if (is_callable($this->options['before_send'])) {
-            $event = call_user_func($this->options['before_send'], $event, $error);
-            if (!$event) {
+            // What before_send hands back is yours: made plain now, so a
+            // value JSON can't hold never fails the batch at send time.
+            $event = Core::plain(call_user_func($this->options['before_send'], $event, $error));
+            if (!$event || !is_array($event)) {
                 return null;
             }
         }

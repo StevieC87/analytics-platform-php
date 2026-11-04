@@ -28,8 +28,8 @@ class Files
     // that changes everything would otherwise read every watched file --
     // MAX_FILES x SIGNAL_BYTES -- inside a PHP worker, after the response.
     const MAX_SIGNAL_FILES = 5000;
-    const EXTENSIONS = '/\.(php[0-9]?|phtml|phar|inc|m?js|cjs|jsx|tsx?|vue|svelte|html?|shtml|ejs|erb|twig|hbs|handlebars|mustache|jinja|j2|njk|liquid|cshtml|vbhtml|py|rb|pl|cgi|sh|aspx?|jsp|svg|json|ya?ml|conf|config|ini)$/i';
-    const PHP_FILE = '/\.(php[0-9]?|phtml|phar)$/i';
+    const EXTENSIONS = '/\.(php[0-9]?|phtml|phar|inc|m?js|cjs|jsx|tsx?|vue|svelte|html?|shtml|ejs|erb|twig|hbs|handlebars|mustache|jinja|j2|njk|liquid|cshtml|vbhtml|py|rb|pl|cgi|sh|aspx?|jsp|svg|json|ya?ml|conf|config|ini)$/Di';
+    const PHP_FILE = '/\.(php[0-9]?|phtml|phar)$/Di';
 
     private static $skipDirs = array('.git', 'node_modules');
     private static $signals = array(
@@ -131,7 +131,7 @@ class Files
         // accepted version (JSON would refuse it, or replace its bad bytes and
         // name a file that isn't there).
         $file = $this->core->dir() . '/files.json';
-        $tmp = $file . '.' . getmypid() . '.tmp';
+        $tmp = $file . '.' . getmypid() . '.' . bin2hex(random_bytes(4)) . '.tmp';
         if (@file_put_contents($tmp, 'ps:' . serialize($this->state), LOCK_EX) === false || !@rename($tmp, $file)) {
             @unlink($tmp);
         }
@@ -349,7 +349,7 @@ class Files
         $host = function_exists('gethostname') ? (string) gethostname() : '';
         $result = $this->core->http('POST', '/events/files/scan', array(
             'site_id' => (string) $this->core->opt('site_id'),
-            'host' => preg_match('/^[A-Za-z0-9._-]{1,100}$/', $host) ? $host : 'server',
+            'host' => preg_match('/^[A-Za-z0-9._-]{1,100}$/D', $host) ? $host : 'server',
             'scan' => array(
                 'at' => self::iso($now), 'roots' => $roots, 'files' => count($current),
                 'baseline' => $fresh && !$accept, 'accepted' => (bool) $accept, 'truncated' => $truncated,
