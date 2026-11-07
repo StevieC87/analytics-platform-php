@@ -344,37 +344,135 @@ class RequestRules
     }
 
     // The first rule that matches, or null. $path is the request target as the
-    // server received it, query string and all.
-    public static function matchRequest(array $rules, $method, $path, $userAgent)
+    // server received it, query string and all; $prepared, when given, is
+    // prepare() of the same request, so the firewall decodes and routes the
+    // path once for the request rules and the page limits both.
+    public static function matchRequest(array $rules, $method, $path, $userAgent, ?array $prepared = null)
     {
         if (!$rules) {
             return null;
         }
-        $target = (string) $path;
-        $mark = strpos($target, '?');
-        $rawPath = self::normalizePath(substr($mark === false ? $target : substr($target, 0, $mark), 0, self::MAX_TEXT));
-        $rawQuery = strtolower(substr($mark === false ? '' : substr($target, $mark + 1), 0, self::MAX_TEXT));
-        $ua = strtolower(substr((string) $userAgent, 0, self::MAX_TEXT));
-        $decodedPath = self::normalizePath(substr(self::decodeOnce(substr($mark === false ? $target : substr($target, 0, $mark), 0, self::MAX_TEXT)), 0, self::MAX_TEXT));
-        $routedPath = substr(self::routedPath(substr($mark === false ? $target : substr($target, 0, $mark), 0, self::MAX_TEXT)), 0, self::MAX_TEXT);
-        // Lowered again after decoding: %55NION is UNION, and the patterns are lower case.
-        $decodedQuery = strtolower(substr(self::decodeOnce($rawQuery), 0, self::MAX_TEXT));
-        $upper = strtoupper((string) $method);
+        $request = $prepared !== null ? $prepared : self::prepare($method, $path, $userAgent);
         foreach ($rules as $rule) {
-            if ($rule['methods'] && !in_array($upper, $rule['methods'], true)) {
-                continue;
+            if (self::matches($rule, $request)) {
+                return $rule;
             }
-            if (isset($rule['path']) && !self::hits($rule['path'], $rawPath, $decodedPath, $routedPath)) {
-                continue;
-            }
-            if (isset($rule['query']) && !self::hits($rule['query'], $rawQuery, $decodedQuery)) {
-                continue;
-            }
-            if (isset($rule['ua']) && !self::hits($rule['ua'], $ua, $ua)) {
-                continue;
-            }
-            return $rule;
         }
         return null;
+    }
+
+    // The request in every form a rule is matched against, worked out once
+    // and shared by the request rules and the page limits.
+    public static function prepare($method, $path, $userAgent)
+    {
+        $target = (string) $path;
+        $mark = strpos($target, '?');
+        $sent = substr($mark === false ? $target : substr($target, 0, $mark), 0, self::MAX_TEXT);
+        $rawQuery = strtolower(substr($mark === false ? '' : substr($target, $mark + 1), 0, self::MAX_TEXT));
+        return array(
+            'method' => strtoupper((string) $method),
+            'path' => self::normalizePath($sent),
+            'decoded_path' => self::normalizePath(substr(self::decodeOnce($sent), 0, self::MAX_TEXT)),
+            'routed' => substr(self::routedPath($sent), 0, self::MAX_TEXT),
+            'query' => $rawQuery,
+            // Lowered again after decoding: %55NION is UNION, and the patterns are lower case.
+            'decoded_query' => strtolower(substr(self::decodeOnce($rawQuery), 0, self::MAX_TEXT)),
+            'ua' => strtolower(substr((string) $userAgent, 0, self::MAX_TEXT)),
+        );
+    }
+
+    // Whether one compiled rule (or page limit) matches a prepare()d request:
+    // every section it names, any one entry within a section.
+    public static function matches(array $rule, array $request)
+    {
+        if ($rule['methods'] && !in_array($request['method'], $rule['methods'], true)) {
+            return false;
+        }
+        if (isset($rule['path']) && !self::hits($rule['path'], $request['path'], $request['decoded_path'], $request['routed'])) {
+            return false;
+        }
+        if (isset($rule['query']) && !self::hits($rule['query'], $request['query'], $request['decoded_query'])) {
+            return false;
+        }
+        if (isset($rule['ua']) && !self::hits($rule['ua'], $request['ua'], $request['ua'])) {
+            return false;
+        }
+        return true;
+    }
+
+    // ---- Page limits ------------------------------------------------------
+    // firewall.md, "Page limits": a cap on one kind of request (the login
+    // form, checkout, search) on top of the site-wide rate. Matched like a
+    // request rule, but on the method, path and query only and without
+    // `regex`, so the server agent's nginx can carry the very same limit.
+
+    const MAX_LIMITS = 50;
+    const LIMIT_ID = '/^[a-z][a-z0-9_.-]{1,39}\z/';
+
+    // The limits as they will be counted; an invalid one is left out, the
+    // others still apply.
+    public static function compileLimits($rules)
+    {
+        $limits = array();
+        foreach (is_array($rules) ? array_slice($rules, 0, self::MAX_LIMITS) : array() as $rule) {
+            if (!is_array($rule) || !isset($rule['id']) || !is_string($rule['id']) || !preg_match(self::LIMIT_ID, $rule['id'])) {
+                continue;
+            }
+            $limit = isset($rule['limit']) ? self::whole($rule['limit']) : null;
+            $window = isset($rule['window']) ? self::whole($rule['window']) : null;
+            if ($limit === null || $limit < 1 || $limit > 100000 || $window === null || $window < 1 || $window > 3600) {
+                continue;
+            }
+            // A kind of `each` this client doesn't know is skipped, not
+            // counted as one: lumping every page together would refuse far
+            // more than the owner asked for.
+            if (isset($rule['each']) && $rule['each'] !== 'path') {
+                continue;
+            }
+            $compiled = array(
+                'id' => $rule['id'],
+                'action' => isset($rule['action']) && $rule['action'] === 'block' ? 'block' : 'monitor',
+                'limit' => $limit,
+                'window' => $window,
+                'each' => isset($rule['each']),
+                'methods' => array(),
+            );
+            if (isset($rule['methods']) && is_array($rule['methods'])) {
+                foreach ($rule['methods'] as $method) {
+                    if (is_string($method) && preg_match('/^[A-Za-z]{1,10}$/D', $method)) {
+                        $compiled['methods'][] = strtoupper($method);
+                    }
+                }
+            }
+            $sections = 0;
+            foreach (array('path', 'query') as $name) {
+                $given = isset($rule[$name]) && is_array($rule[$name]) ? $rule[$name] : null;
+                // No `regex` in a limit: what is left of the section is kept,
+                // and a section that was only a pattern is no section at all.
+                if ($given !== null) {
+                    unset($given['regex']);
+                }
+                $section = self::section($given);
+                if ($section !== null) {
+                    $compiled[$name] = $section;
+                    $sections++;
+                }
+            }
+            // Nothing to match would count every request on the site.
+            if (!$sections) {
+                continue;
+            }
+            $limits[] = $compiled;
+        }
+        return $limits;
+    }
+
+    // A whole number from the rules (JSON may write 60 as 60.0), else null.
+    private static function whole($value)
+    {
+        if (is_int($value)) {
+            return $value;
+        }
+        return is_float($value) && floor($value) === $value && abs($value) < 1e9 ? (int) $value : null;
     }
 }

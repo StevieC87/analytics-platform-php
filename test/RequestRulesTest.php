@@ -114,5 +114,18 @@ if (microtime(true) - $started > 1.0) {
     echo "FAIL matching should stay quick on a long path\n";
 }
 
+// The firewall prepares a request once for the request rules and the page
+// limits; a prepared request decides as the raw one does.
+$prepared = RequestRules::prepare('GET', '/x;y/../admin/users?q=1', 'UA');
+$routedRule = RequestRules::compile(array('rules' => array(
+    array('id' => 'admin', 'action' => 'block', 'path' => array('prefix' => array('/admin'))),
+)));
+$checked++;
+if (RequestRules::matchRequest($routedRule, '', '', '', $prepared) !== RequestRules::matchRequest($routedRule, 'GET', '/x;y/../admin/users?q=1', 'UA')
+    || RequestRules::matchRequest($routedRule, '', '', '', $prepared) === null) {
+    $failed++;
+    echo "FAIL a prepared request should match as the raw one does\n";
+}
+
 printf("%d checks, %d failed\n", $checked, $failed);
 exit($failed ? 1 : 0);

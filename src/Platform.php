@@ -34,7 +34,9 @@ class Platform
     // module 'firewall' / 'errors' / 'analytics' / 'performance' => true, false
     // or an array of that module's options (errors: server_name, root,
     // before_send; performance: server_name; queries: the database queries
-    // timed with Server speed, on with it unless false, see Queries; files:
+    // timed with Server speed, on with it unless false, see Queries; calls:
+    // the outgoing HTTP calls, likewise; queues: job queue backlogs, likewise,
+    // see Queues; files:
     // roots and the rest, see Files; off unless given; inventory: root and the rest, see Inventory;
     // posture: roots and the callbacks, see Posture). server_name names this
     // service for every module that sends one (errors, performance, crawlers,
@@ -43,17 +45,31 @@ class Platform
     {
         $this->core = new Core($options);
         $this->options = $options;
-        foreach (array('proxy', 'firewall', 'errors', 'analytics', 'performance', 'queries', 'crawlers', 'forms', 'headers', 'audit', 'flags', 'maintenance', 'files', 'inventory', 'posture', 'resources') as $name) {
+        foreach (array('proxy', 'firewall', 'errors', 'analytics', 'performance', 'queries', 'queues', 'crawlers', 'forms', 'headers', 'audit', 'flags', 'maintenance', 'files', 'inventory', 'posture', 'resources') as $name) {
             // File monitoring needs its folders, and the set-up checks walk the
             // web folder once a day: both are off unless asked for. (The
             // WordPress plugin asks for them.)
             $setting = array_key_exists($name, $options) ? $options[$name] : !in_array($name, array('files', 'posture'), true);
-            // Query timings are a part of Server speed: never without it.
-            if ($setting === false || $setting === null || ($name === 'queries' && !isset($this->modules['performance']))) {
+            $key = $name;
+            if ($name === 'queries') {
+                // Queries and outgoing calls are one module, kept under
+                // 'calls' when queries are off.
+                $calls = array_key_exists('calls', $options) ? $options['calls'] : true;
+                $queriesOn = $setting !== false && $setting !== null;
+                $callsOn = $calls !== false && $calls !== null;
+                if (!$queriesOn && !$callsOn) {
+                    continue;
+                }
+                $setting = (is_array($setting) ? $setting : array()) + array('queries' => $queriesOn, 'calls' => $callsOn);
+                $key = $queriesOn ? 'queries' : 'calls';
+            }
+            // Query and call timings and queue backlogs are a part of Server
+            // speed: never without it.
+            if ($setting === false || $setting === null || (in_array($name, array('queries', 'queues'), true) && !isset($this->modules['performance']))) {
                 continue;
             }
             $own = is_array($setting) ? $setting : array();
-            if (!empty($options['server_name']) && in_array($name, array('errors', 'performance', 'queries', 'crawlers', 'resources'), true)) {
+            if (!empty($options['server_name']) && in_array($name, array('errors', 'performance', 'queries', 'queues', 'crawlers', 'resources'), true)) {
                 $own += array('server_name' => (string) $options['server_name']);
             }
             try {
@@ -71,7 +87,10 @@ class Platform
                 } elseif ($name === 'performance') {
                     $this->modules[$name] = new Performance($this->core, $own);
                 } elseif ($name === 'queries') {
-                    $this->modules[$name] = new Queries($this->core, $own);
+                    $this->modules[$key] = new Queries($this->core, $own);
+                    $this->modules['performance']->setTimings($this->modules[$key]);
+                } elseif ($name === 'queues') {
+                    $this->modules[$name] = new Queues($this->core, $own);
                 } elseif ($name === 'resources') {
                     $this->modules[$name] = new Resources($this->core, $own);
                 } elseif ($name === 'crawlers') {
@@ -128,6 +147,12 @@ class Platform
     public function firewall()
     {
         return $this->module('firewall');
+    }
+
+    // The queries module, which times both queries and outgoing calls.
+    private function timings()
+    {
+        return isset($this->modules['queries']) ? $this->modules['queries'] : (isset($this->modules['calls']) ? $this->modules['calls'] : null);
     }
 
     // The visitor's address: the framework's when it gave one (Laravel's
@@ -286,13 +311,79 @@ class Platform
         }
     }
 
+    // An outgoing HTTP call your own hook timed (the packaged ones: Laravel's
+    // Http client, Symfony's HttpClientBreadcrumbs, guzzleMiddleware(), the
+    // WordPress plugin): $ms from sending it to its answer's headers, and
+    // $status the answer's, 0 when none came. Only the host is kept.
+    public function recordCall($method, $url, $ms, $status)
+    {
+        $timings = $this->timings();
+        if ($timings) {
+            $timings->recordCall($method, $url, $ms, $status);
+        }
+    }
+
+    // Guzzle: each call timed for Server speed → Calls and added to the
+    // steps before an error, from Guzzle's own middleware interface and its
+    // on_headers option (a callback of yours there still runs):
+    //   $stack = GuzzleHttp\HandlerStack::create();
+    //   $stack->push($platform->guzzleMiddleware());
+    //   $client = new GuzzleHttp\Client(['handler' => $stack]);
+    // Not for Laravel's Http client, which is timed on its own.
+    public function guzzleMiddleware()
+    {
+        $platform = $this;
+        return function (callable $handler) use ($platform) {
+            return function ($request, array $options) use ($handler, $platform) {
+                $started = microtime(true);
+                $headers = null;
+                $theirs = isset($options['on_headers']) && is_callable($options['on_headers']) ? $options['on_headers'] : null;
+                // Each hop of a redirect: the last one's headers are the answer.
+                $options['on_headers'] = function ($response) use (&$headers, $theirs) {
+                    $headers = microtime(true);
+                    if ($theirs) {
+                        $theirs($response);
+                    }
+                };
+                $method = (string) $request->getMethod();
+                $url = (string) $request->getUri();
+                // Never lets anything of ours replace the answer or the reason.
+                $done = function ($status) use ($platform, $method, $url, $started, &$headers) {
+                    try {
+                        $platform->recordCall($method, $url, ((($headers !== null ? $headers : microtime(true)) - $started) * 1000), $status);
+                        $platform->addRequestBreadcrumb($method, $url, $status);
+                    } catch (\Throwable $e) {
+                        // untimed
+                    }
+                };
+                return $handler($request, $options)->then(function ($response) use ($done) {
+                    $done(is_object($response) && method_exists($response, 'getStatusCode') ? (int) $response->getStatusCode() : 0);
+                    return $response;
+                }, function ($reason) use ($done) {
+                    // Cancelled by the code: not a failure of the other side.
+                    if (!(is_object($reason) && is_a($reason, 'GuzzleHttp\\Promise\\CancellationException'))) {
+                        // An error answer (http_errors) is still an answer.
+                        $response = is_object($reason) && method_exists($reason, 'getResponse') ? $reason->getResponse() : null;
+                        $done(is_object($response) && method_exists($response, 'getStatusCode') ? (int) $response->getStatusCode() : 0);
+                    }
+                    if (class_exists('GuzzleHttp\\Promise\\Create')) {
+                        return \GuzzleHttp\Promise\Create::rejectionFor($reason);
+                    }
+                    return \GuzzleHttp\Promise\rejection_for($reason);
+                });
+            };
+        };
+    }
+
     // A worker that serves many requests from one process (Octane,
-    // RoadRunner, FrankenPHP) starting the next one: the queries left from
-    // the last are forgotten, and those outside a job belong to requests.
+    // RoadRunner, FrankenPHP) starting the next one: the queries and calls
+    // left from the last are forgotten, and those outside a job belong to
+    // requests.
     public function beginRequest()
     {
-        if (isset($this->modules['queries'])) {
-            $this->modules['queries']->beginRequest();
+        $timings = $this->timings();
+        if ($timings) {
+            $timings->beginRequest();
         }
     }
 
@@ -523,8 +614,9 @@ class Platform
         if (isset($this->modules['errors'])) {
             $this->modules['errors']->setJob($route);
         }
-        if (isset($this->modules['queries'])) {
-            $this->modules['queries']->startJob();
+        $timings = $this->timings();
+        if ($timings) {
+            $timings->startJob();
         }
     }
 
@@ -539,14 +631,12 @@ class Platform
             $this->modules['errors']->setJob($outer ? $outer[0] : '');
         }
         $performance = isset($this->modules['performance']) ? $this->modules['performance'] : null;
-        $recorded = false;
+        // Its queries and calls ride in the run's own line, so they are sent
+        // under exactly what the run is filed as.
+        $queries = $this->timings();
+        $extra = $queries ? $queries->takeJob() : array();
         if ($performance) {
-            $recorded = $performance->recordJob($route, $failed ? 500 : 200, (microtime(true) - $started) * 1000);
-        }
-        // Its queries, under the time, method and route the run was recorded with.
-        $queries = isset($this->modules['queries']) ? $this->modules['queries'] : null;
-        if ($queries) {
-            $queries->endJob($recorded);
+            $performance->recordJob($route, $failed ? 500 : 200, (microtime(true) - $started) * 1000, $extra);
         }
         if (PHP_SAPI === 'cli') {
             // A worker being stopped mustn't outlast its grace period.
@@ -608,7 +698,8 @@ class Platform
             $analytics = isset($this->modules['analytics']) ? $this->modules['analytics'] : null;
             $firewall = isset($this->modules['firewall']) ? $this->modules['firewall'] : null;
             $performance = isset($this->modules['performance']) ? $this->modules['performance'] : null;
-            $queries = isset($this->modules['queries']) ? $this->modules['queries'] : null;
+            $queries = $this->timings();
+            $queues = isset($this->modules['queues']) ? $this->modules['queues'] : null;
             $crawlers = isset($this->modules['crawlers']) ? $this->modules['crawlers'] : null;
             $resources = isset($this->modules['resources']) ? $this->modules['resources'] : null;
             $audit = isset($this->modules['audit']) ? $this->modules['audit'] : null;
@@ -617,15 +708,18 @@ class Platform
             $posture = isset($this->modules['posture']) && !$this->modules['posture']->manual() && $this->core->isOn('inventory')
                 ? $this->modules['posture'] : null;
             // Timed before anything below: what follows happens after the response.
-            $recorded = false;
             if ($performance && $this->protected) {
-                $recorded = $performance->recordRequest();
+                // The request's queries and calls ride in its own line.
+                $performance->recordRequest($queries ? $queries->takeRequest() : array());
             }
-            // The request's queries, under the method and route it was
-            // recorded with; a run that isn't a timed request (WordPress's
-            // cron) is background work.
+            // What's left of them: a run that isn't a timed request
+            // (WordPress's cron) is background work.
             if ($queries) {
-                $queries->endRequest($recorded);
+                $queries->endRequest();
+            }
+            // The jobs this request added to a queue.
+            if ($queues) {
+                $queues->save();
             }
             if ($crawlers && $this->protected) {
                 $crawlers->recordRequest($this->clientIp());
@@ -635,7 +729,7 @@ class Platform
                 $errors->onShutdown();
             }
             $busy = ($errors && ($errors->pending() || $errors->due())) || ($analytics && ($analytics->pending() || $analytics->due())) || ($audit && ($audit->pending() || $audit->due())) || $this->core->switchesDue()
-                || ($performance && $performance->due()) || ($queries && $queries->due()) || ($crawlers && $crawlers->due()) || ($resources && $resources->due()) || ($inventory && $inventory->due()) || ($posture && $posture->due());
+                || ($performance && $performance->due()) || ($queries && $queries->due()) || ($queues && $queues->due()) || ($crawlers && $crawlers->due()) || ($resources && $resources->due()) || ($inventory && $inventory->due()) || ($posture && $posture->due());
             // Closes the connection so everything below happens after the
             // response. LiteSpeed has its own name for it, and Apache's
             // mod_php has neither: there the visitor waits for the send,
@@ -663,6 +757,9 @@ class Platform
             }
             if ($queries) {
                 $queries->flush();
+            }
+            if ($queues) {
+                $queues->flush();
             }
             if ($crawlers) {
                 $crawlers->flush();

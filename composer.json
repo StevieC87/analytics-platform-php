@@ -25,7 +25,9 @@
     "symfony/framework-bundle": "For AnalyticsPlatform\\Symfony\\PlatformSubscriber (Symfony 6.4 or later)",
     "symfony/monolog-bundle": "For AnalyticsPlatform\\Symfony\\LogProcessor (the exceptions you log)",
     "symfony/http-client": "For AnalyticsPlatform\\Symfony\\HttpClientBreadcrumbs (its requests before an error)",
-    "doctrine/dbal": "For AnalyticsPlatform\\Symfony\\QueryMiddleware (3.2 or later: Doctrine's query timings)"
+    "doctrine/dbal": "For AnalyticsPlatform\\Symfony\\QueryMiddleware (3.2 or later: Doctrine's query timings)",
+    "guzzlehttp/guzzle": "For Platform::guzzleMiddleware() (its calls' times, and steps before an error)",
+    "smi2/phpclickhouse": "For AnalyticsPlatform\\TimedClickHouse (ClickHouse query timings)"
   },
   "autoload": {
     "psr-4": {

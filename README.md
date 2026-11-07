@@ -53,8 +53,10 @@ own trusted proxies decide (`$request->ip()`, `getClientIp()`).
 | `headers` | Adds the security headers you pick on the Security page; your own headers win | on |
 | `forms` | Checks forms before you accept them: `$platform->checkForm()` (Laravel: the `ProtectForm` middleware) | on |
 | `performance` | Response times and errors per route (Health → Server speed); name a route with `$platform->setRoute('/orders/{id}')` | on |
-| `queries` | With `performance`: every database query's time per route (Health → Server speed → Queries), its values replaced by `?` before anything is counted. Laravel: automatic; Symfony: `QueryMiddleware`; plain PHP: `TimedPdo`; MongoDB: automatic with the `mongodb` extension; WordPress: automatic (see "Database queries") | on |
-| `crawlers` | Which search engines and AI bots fetch your pages (Health → Crawlers). Your tracker can't see them: crawlers don't run JavaScript | on |
+| `queries` | With `performance`: every database query's time per route (Health → Server speed → Queries), its values replaced by `?` before anything is counted. Laravel: automatic; Symfony: `QueryMiddleware`; plain PHP: `TimedPdo`, `TimedClickHouse`; MongoDB: automatic with the `mongodb` extension; WordPress: automatic (see "Database queries") | on |
+| `calls` | With `performance`: how long each route waited on other services, by the host it called (Health → Server speed → Calls). Laravel's `Http` client: automatic; Symfony: `HttpClientBreadcrumbs`; Guzzle: `guzzleMiddleware()`; WordPress: automatic (see "Outgoing calls") | on |
+| `queues` | With `performance`: each job queue's backlog once a minute, and the jobs added and finished (Health → Server speed → Jobs). Laravel: automatic in `queue:work` (see "Job queues") | on |
+| `crawlers` | Which search engines and AI bots fetch your pages (Off-site → Crawlers). Your tracker can't see them: crawlers don't run JavaScript | on |
 | `inventory` | Once a day, after a response, reports your Composer packages (`composer.lock`, not dev packages) and PHP version, so Security → Security check flags known security holes in them. Names and versions only. `'inventory' => ['root' => '/path/with/composer.lock']` when it isn't the document root's parent (protocol: `sdk/protocols/inventory.md`; WordPress: plugins, themes and core too, through WP-Cron) | on |
 | `posture` | Once a day, how the server is set up: the php.ini settings that leave it open, and a walk of the web folder for code anyone can write and files that shouldn't be public (a database dump, a `.env`, a backup copy). Security → Security check says what to change, and asks your site for each of those files to see whether it really is downloadable. Reads only, and sends no file's contents. `'posture' => ['roots' => [__DIR__ . '/public']]`; Laravel: `ANALYTICS_POSTURE=true` (protocol: `sdk/protocols/posture.md`; WordPress: its own settings, admin accounts and scheduled jobs too, through WP-Cron) | off |
 | `files` | File monitoring: `'files' => ['roots' => [__DIR__ . '/public']]`, then `$platform->checkFiles()` from a cron job, hourly; `$platform->checkFiles(true, true)` after a deploy accepts the files as they are (protocol: `sdk/protocols/files.md`). Changed code, backdoors and defacement show in Security → Page integrity (WordPress: automatic, through WP-Cron) | off |
@@ -162,8 +164,10 @@ a later request; each error keeps the time it happened.
 An error also shows the steps before it in its request or job. Add your own
 with `$platform->addBreadcrumb('Order saved')`. In Laravel, calls made with its
 `Http` client are recorded on their own, with their address (no query string)
-and status; in Symfony, its HttpClient's (`HttpClientBreadcrumbs`). Plain PHP can't see outgoing calls, so there it's only your own
-steps. To send none, unset `$event['breadcrumbs']` in `before_send`.
+and status; in Symfony, its HttpClient's (`HttpClientBreadcrumbs`); with
+Guzzle, its client's once you add `guzzleMiddleware()` (see "Outgoing
+calls"). Other calls plain PHP can't see, so there it's only your own steps.
+To send none, unset `$event['breadcrumbs']` in `before_send`.
 
 Background jobs (a worker, a cron script):
 
@@ -197,6 +201,17 @@ dashboard switch; `'queries' => false` keeps Server speed without it.
   timed; prepared statements aren't on a persistent connection or with a statement
   class of your own. Your own hook for anything else:
   `$platform->recordQuery('postgresql', $sql, $ms, $failed)`.
+- **ClickHouse** (`smi2/phpclickhouse`): its client has no hook a query passes
+  through, so put the timer in front of the one you make:
+  `$db = new AnalyticsPlatform\TimedClickHouse(new ClickHouseDB\Client($config));`.
+  `select()`, `write()`, `insert()`, `insertAssocBulk()`, `selectWithParams()`
+  and `writeWithParams()` are timed until they answer, `selectAsync()` ones once
+  `executeAsync()` has run them; everything else goes straight through. A select
+  the server refused counts as failed, though the library only throws when you
+  read it, and an insert is counted as `INSERT INTO events (site, email) VALUES (?)`,
+  its rows never read. Code that type-hints `ClickHouseDB\Client` can't take the
+  stand-in: time those with `recordQuery('clickhouse', ...)`. A `TimedPdo` on a
+  ClickHouse PDO driver is named `clickhouse` too.
 - **MongoDB:** with the `mongodb` extension loaded, a command subscriber is added on
   its own (`find users {"email":"?"}`); Laravel's mongodb connections are left to it.
 - **WordPress:** the plugin writes `wp-content/db.php` on activation, when there is
@@ -206,6 +221,104 @@ dashboard switch; `'queries' => false` keeps Server speed without it.
 - **Workers** serving many requests from one process: Octane and the Symfony
   subscriber start each request's queries afresh on their own; elsewhere call
   `$platform->beginRequest()` as each request starts.
+
+A request's queries are written down with its own timing, so they are always
+filed under the route Server speed filed the request under, `(other)` included
+on a minute with more routes than it keeps.
+
+## Outgoing calls
+
+Health → Server speed → Calls shows how long each route waited on other
+services — a payment provider, an email API, your own microservices — by the
+host it called (`api.stripe.com`), and how many of those calls failed. Through
+the hooks the error trail already uses:
+
+- **Laravel:** automatic, from its `Http` client's own events (`RequestSending`
+  to `ResponseReceived` or `ConnectionFailed`). Laravel announces the answer
+  once its body is read, so the time includes the body. `ANALYTICS_CALLS=false`
+  turns it off.
+- **Symfony:** `HttpClientBreadcrumbs` (see "Symfony"), timed to the first
+  chunk: when the headers arrive.
+- **Guzzle** (plain PHP, or a client you build yourself), timed to its headers
+  through its `on_headers` option (yours still runs):
+
+  ```php
+  $stack = GuzzleHttp\HandlerStack::create();
+  $stack->push($platform->guzzleMiddleware());
+  $client = new GuzzleHttp\Client(['handler' => $stack]);
+  ```
+
+  Not for Laravel's `Http` client, which is timed on its own: both would count
+  each call twice.
+- **WordPress:** automatic, from `pre_http_request` to `http_api_debug`.
+  WordPress reads the whole answer before it says so, so the time includes the
+  body. A call that doesn't wait for its answer (`blocking => false`) isn't timed.
+- Your own hook for anything else: `$platform->recordCall('POST', $url, $ms, $status)`
+  (`$status` 0 when no answer came).
+
+- **Only the host is sent.** A call's path, query string, headers and body
+  never leave your server: paths carry IDs and keys.
+- A call that got no answer, or a 5xx, is a failed one; a 4xx is the other
+  side's answer, not a failure. A call your code cancels isn't counted.
+- Calls are filed as queries are: under the request, the `job()`, or `JOB
+  (background)`. The package's own calls to us are left out.
+- They ride on Server speed's switch; `'calls' => false` leaves them out.
+  Protocol: `sdk/protocols/calls.md`.
+
+## Job queues
+
+Health → Server speed → Jobs shows each queue's backlog once a minute: jobs
+waiting, running, delayed and failed, how long the oldest has waited, and jobs
+added against jobs finished — so a queue falling behind shows before the
+emails go out an hour late. Laravel, nothing to set up:
+
+- Every process counts the jobs it adds (`JobQueued`); `queue:work` counts the
+  ones it finishes (`JobProcessed`, unless the job was released to run again,
+  and `JobFailed`, which comes once a job has failed for good).
+- PHP has no loop of its own between requests, so `queue:work` reads its
+  queues between jobs (the `Looping` event), at most once a minute:
+  `Queue::size()`, or where your Laravel's queue has them `pendingSize()`,
+  `delayedSize()`, `reservedSize()` and `creationTimeOfOldestPendingJob()`;
+  failed from the failed-job store's `count()`. Without `pendingSize()`,
+  waiting is `size()`, which also counts delayed and running jobs, and what
+  the queue can't say is left out. No worker running, no reading: a gap, not a
+  zero. `queue:work --once` and `queue:listen` don't loop, so they read nothing.
+- The queues it reads are the ones the worker processes; more with
+  `ANALYTICS_WATCH_QUEUES=redis:emails,default` (`connection:queue`, or a queue
+  on the default connection).
+- The broker is named by host, port and database (`cache.internal:6379/0`),
+  from the connection's settings; never a user name or password.
+- Readings and counts are kept on disk and sent one finished minute at a time.
+  Several workers reading one queue is fine: the dashboard takes the largest
+  reading, never the sum.
+- They ride on Server speed's switch; `ANALYTICS_QUEUES=false` (`'queues' =>
+  false`) leaves them out. Protocol: `sdk/protocols/queues.md`.
+
+## Server resources and limits
+
+About once a minute, from a request (PHP has no process between requests), the
+`resources` module samples the machine — CPU, load, memory, swap, disks,
+throughput — and how close the site is to a wall, which on a container or a
+busy pool is rarely the machine (Health → Server speed):
+
+- **Its container's caps:** the memory cap and the working set that counts
+  against it (`memory.current` less inactive page cache, as Docker shows it),
+  the CPU cap in cores and how often it throttled the site, and processes the
+  kernel killed for memory, from the cgroup (v1 or v2). A cap that isn't one
+  (none set, or at or above the machine's own) is left out.
+- **PHP-FPM's pool**, from `fpm_get_status()`: workers busy, connections
+  waiting for one, and how often the pool wanted another worker and was at
+  `pm.max_children`; its maximum only under `pm = static`, where every child is
+  the maximum. The pool also names the row and says how long it has run, so an
+  FPM restart shows.
+- **The machine:** how long tasks waited for CPU, memory and disk
+  (`/proc/pressure`), connections refused before PHP saw them (the listen
+  queue overflowing), and how full the connection-tracking table is.
+- Counts (kills, the pool at its cap, refused connections) are differences
+  between two samples, kept in `storage`, and keep their whole difference after
+  a quiet hour; after a reboot they start again. Nothing this machine won't say is sent as a zero. No open
+  files and no requests in progress: each request is a process of its own,
+  so the pool's figures are the ones that say it.
 
 ## Laravel
 
@@ -223,7 +336,7 @@ In your code: `app(AnalyticsPlatform\Platform::class)->track('purchase', [...])`
 The visitor's address is `$request->ip()`, so set up Laravel's trusted proxies
 if you're behind a load balancer or Cloudflare. The rate limit counts in your
 cache store (not the `array` driver). Modules: `ANALYTICS_FIREWALL`,
-`ANALYTICS_ERRORS`, `ANALYTICS_SERVER_EVENTS`, `ANALYTICS_INVENTORY`, `ANALYTICS_QUERIES` (`false` turns one off).
+`ANALYTICS_ERRORS`, `ANALYTICS_SERVER_EVENTS`, `ANALYTICS_INVENTORY`, `ANALYTICS_QUERIES`, `ANALYTICS_CALLS`, `ANALYTICS_QUEUES` (`false` turns one off).
 `ANALYTICS_CAPTURE_LOGS=true` also sends exceptions you log at error or above
 (`Log::error('...', ['exception' => $e])`). It works the same under Octane
 (Swoole, RoadRunner, FrankenPHP): nothing of one request is kept for the next.
@@ -251,7 +364,7 @@ already has:
                 counter: '@AnalyticsPlatform\Symfony\CacheCounter'
     AnalyticsPlatform\Symfony\CacheCounter: ~
     AnalyticsPlatform\Symfony\PlatformSubscriber: ~
-    # With symfony/http-client: its requests in the steps before an error.
+    # With symfony/http-client: its requests in the steps before an error, and their times.
     AnalyticsPlatform\Symfony\HttpClientBreadcrumbs: ~
     # Optional: also send the exceptions you log at error or above.
     # AnalyticsPlatform\Symfony\LogProcessor: ~
@@ -286,8 +399,8 @@ In your code, ask for `AnalyticsPlatform\Platform` in a controller or service:
   thrown is sent once.
 - **HttpClient.** `HttpClientBreadcrumbs` records each request your HttpClient
   makes (the default client and scoped ones): method, address without the query
-  string, status, 0 when no answer came. Leave the line out if you don't use
-  `symfony/http-client`.
+  string, status, 0 when no answer came; and times each for Server speed →
+  Calls by its host. Leave the line out if you don't use `symfony/http-client`.
 - **Only some routes.** `protect_only: ['/admin', 'checkout', 'account_*']` under
   `$options` puts the firewall and maintenance mode in front of those paths
   (and everything below them) and route names (`*` at the end: every name that

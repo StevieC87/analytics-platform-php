@@ -385,6 +385,409 @@ class Resources
         return isset($fields[0]) && is_numeric($fields[0]) ? (int) $fields[0] : null;
     }
 
+    // ---- Limits: how close the site is to a wall ------------------------------------
+    // (resources.md, "Limits"; sdk/platform-node/lib/limits.js is the
+    // reference). Inside Docker or Kubernetes the machine's figures are the
+    // wrong question: /proc/meminfo is the host's, so memory reads 40% while
+    // the container is a few megabytes from being killed. The cgroup's files
+    // are the limits the kernel enforces, PHP-FPM's status says how full the
+    // worker pool is, and the kernel says how long tasks waited and how many
+    // connections it refused before PHP saw them.
+    //
+    // The counts (out-of-memory kills, the pool at its cap, refused
+    // connections) are differences between this sample and the last one, kept
+    // in resources.state like the CPU counters; unlike a rate they keep their
+    // whole difference after a long gap, since a kill must not vanish because
+    // nobody visited for an hour. Every reader gives null for a file that
+    // isn't there, which outside Linux is all of them: nothing is sent then.
+    //
+    // Not here, on purpose: open files and requests in progress at once.
+    // Each request is a process of its own (FPM, mod_php), so this process's
+    // descriptors are one request's and the most in progress at once is
+    // always this one; the pool's figures (workers_busy, queue_waiting) are
+    // what says how many were in progress.
+
+    // cgroup v1 says "no limit" with the largest page-aligned 64-bit number;
+    // v2 says "max". Anything this size is not a cap a machine has.
+    const NO_LIMIT_BYTES = 4611686018427387904.0;
+
+    // A number from a file holding one, or null for a missing or unreadable
+    // one: '' must never become the zero this module must not invent.
+    private static function num($text)
+    {
+        $text = trim((string) $text);
+        return $text !== '' && is_numeric($text) ? (float) $text : null;
+    }
+
+    // "name value" lines (memory.stat, cpu.stat, memory.events) as numbers.
+    public static function keyValues($text)
+    {
+        $out = array();
+        foreach (explode("\n", (string) $text) as $line) {
+            $parts = preg_split('/\s+/', trim($line));
+            if (count($parts) >= 2 && $parts[0] !== '' && ($n = self::num($parts[1])) !== null) {
+                $out[$parts[0]] = $n;
+            }
+        }
+        return $out;
+    }
+
+    // /proc/self/cgroup: the v2 path ("0::<path>") and the v1 memory and cpu
+    // controllers' paths ("4:memory:<path>", "3:cpu,cpuacct:<path>").
+    public static function cgroupPaths($text)
+    {
+        $out = array('v2' => null, 'memory' => null, 'cpu' => null);
+        foreach (explode("\n", (string) $text) as $line) {
+            $parts = explode(':', $line, 3);
+            if (count($parts) < 3) {
+                continue;
+            }
+            $at = trim($parts[2]);
+            if ($at === '') {
+                continue;
+            }
+            $controllers = explode(',', $parts[1]);
+            if ($parts[0] === '0' && $parts[1] === '') {
+                $out['v2'] = $at;
+            }
+            if (in_array('memory', $controllers, true)) {
+                $out['memory'] = $at;
+            }
+            if (in_array('cpu', $controllers, true)) {
+                $out['cpu'] = $at;
+            }
+        }
+        return $out;
+    }
+
+    // Where this process's cgroup files are, or null. Under the mount at the
+    // path /proc/self/cgroup names first, then the mount itself: in a
+    // container with its own cgroup namespace the path is "/" and the mount
+    // is already the container's; without one the path names the host's
+    // hierarchy. v2 needs the memory or cpu controller's own files, not just
+    // the directory: a hybrid machine lists a v2 path with no controllers in
+    // it while the limits live in v1.
+    public static function findCgroup(callable $read)
+    {
+        $paths = self::cgroupPaths($read('/proc/self/cgroup'));
+        $under = function ($base, $at, array $probes) use ($read) {
+            foreach ($at !== null && $at !== '/' ? array($base . $at, $base) : array($base) as $dir) {
+                foreach ($probes as $probe) {
+                    if ($read($dir . '/' . $probe) !== '') {
+                        return $dir;
+                    }
+                }
+            }
+            return null;
+        };
+        if ($paths['v2'] !== null) {
+            $dir = $under('/sys/fs/cgroup', $paths['v2'], array('memory.current', 'cpu.max'));
+            if ($dir !== null) {
+                return array('version' => 2, 'memory' => $dir, 'cpu' => $dir);
+            }
+        }
+        $memory = $paths['memory'] !== null ? $under('/sys/fs/cgroup/memory', $paths['memory'], array('memory.usage_in_bytes')) : null;
+        $cpu = $paths['cpu'] !== null ? $under('/sys/fs/cgroup/cpu', $paths['cpu'], array('cpu.cfs_quota_us')) : null;
+        return $memory !== null || $cpu !== null ? array('version' => 1, 'memory' => $memory, 'cpu' => $cpu) : null;
+    }
+
+    // One reading of the cgroup's caps and counters, in bytes and raw counts.
+    public static function cgroupReading($cg, callable $read)
+    {
+        if (!is_array($cg)) {
+            return null;
+        }
+        $out = array('memCap' => null, 'memUsed' => null, 'cpuCores' => null, 'periods' => null, 'throttled' => null, 'oom' => null);
+        if ($cg['version'] === 2) {
+            $max = trim($read($cg['memory'] . '/memory.max'));
+            $out['memCap'] = $max === 'max' ? null : self::num($max);
+            $current = self::num($read($cg['memory'] . '/memory.current'));
+            // The working set: page cache counts against the cgroup too, so
+            // memory.current sits near the cap on a healthy container that
+            // reads files. Less inactive_file is what Docker and the kubelet report.
+            $stat = self::keyValues($read($cg['memory'] . '/memory.stat'));
+            if ($current !== null) {
+                $out['memUsed'] = max(0.0, $current - (isset($stat['inactive_file']) ? $stat['inactive_file'] : 0.0));
+            }
+            $events = self::keyValues($read($cg['memory'] . '/memory.events'));
+            $out['oom'] = isset($events['oom_kill']) ? $events['oom_kill'] : null;
+            $parts = preg_split('/\s+/', trim($read($cg['cpu'] . '/cpu.max')));
+            if (count($parts) >= 2 && $parts[0] !== 'max' && self::num($parts[0]) > 0 && self::num($parts[1]) > 0) {
+                $out['cpuCores'] = self::num($parts[0]) / self::num($parts[1]);
+            }
+            $cpu = self::keyValues($read($cg['cpu'] . '/cpu.stat'));
+            $out['periods'] = isset($cpu['nr_periods']) ? $cpu['nr_periods'] : null;
+            $out['throttled'] = isset($cpu['nr_throttled']) ? $cpu['nr_throttled'] : null;
+            return $out;
+        }
+        if ($cg['memory'] !== null) {
+            $out['memCap'] = self::num($read($cg['memory'] . '/memory.limit_in_bytes'));
+            $usage = self::num($read($cg['memory'] . '/memory.usage_in_bytes'));
+            $stat = self::keyValues($read($cg['memory'] . '/memory.stat'));
+            if ($usage !== null) {
+                $out['memUsed'] = max(0.0, $usage - (isset($stat['total_inactive_file']) ? $stat['total_inactive_file'] : 0.0));
+            }
+            // Kernels from 4.13 carry the count here.
+            $control = self::keyValues($read($cg['memory'] . '/memory.oom_control'));
+            $out['oom'] = isset($control['oom_kill']) ? $control['oom_kill'] : null;
+        }
+        if ($cg['cpu'] !== null) {
+            $quota = self::num($read($cg['cpu'] . '/cpu.cfs_quota_us'));
+            $period = self::num($read($cg['cpu'] . '/cpu.cfs_period_us'));
+            if ($quota > 0 && $period > 0) {
+                $out['cpuCores'] = $quota / $period;
+            }
+            $cpu = self::keyValues($read($cg['cpu'] . '/cpu.stat'));
+            $out['periods'] = isset($cpu['nr_periods']) ? $cpu['nr_periods'] : null;
+            $out['throttled'] = isset($cpu['nr_throttled']) ? $cpu['nr_throttled'] : null;
+        }
+        return $out;
+    }
+
+    // How much a counter moved between two readings, or null: no pair, or it
+    // went down, which is a reset and not a negative count. Never dropped
+    // for the pair being far apart.
+    public static function countSince($before, $after)
+    {
+        if (!is_numeric($before) || !is_numeric($after) || $after < $before) {
+            return null;
+        }
+        return (int) round($after - $before);
+    }
+
+    // The row's cgroup fields from two readings. A cap at or above what the
+    // machine itself has isn't one (a systemd slice with no MemoryMax, or a
+    // container allowed more cores than the host), so neither half is sent.
+    // The throttled share is a rate over the interval, so like the CPU
+    // figures it needs a usable one ($usable).
+    public static function cgroupFields($before, $after, $memTotalMb = null, $cores = null, $usable = true)
+    {
+        $out = array();
+        if (!is_array($after)) {
+            return $out;
+        }
+        $capMb = $after['memCap'] > 0 && $after['memCap'] < self::NO_LIMIT_BYTES ? (int) floor($after['memCap'] / 1048576) : 0;
+        if ($capMb > 0 && !($memTotalMb && $capMb >= $memTotalMb) && $after['memUsed'] !== null) {
+            $out['limit_mem_mb'] = $capMb;
+            $out['limit_mem_used_mb'] = min($capMb, (int) floor($after['memUsed'] / 1048576));
+        }
+        if ($after['cpuCores'] && !($cores && $after['cpuCores'] >= $cores)) {
+            $out['limit_cpu_cores'] = round($after['cpuCores'], 2);
+        }
+        $before = is_array($before) ? $before : array();
+        // Periods only pass while a quota is set, so no cap means nothing sent.
+        $periods = self::countSince(isset($before['periods']) ? $before['periods'] : null, $after['periods']);
+        $throttled = self::countSince(isset($before['throttled']) ? $before['throttled'] : null, $after['throttled']);
+        if ($usable && $periods > 0 && $throttled !== null) {
+            $out['cpu_throttled_pct'] = round(min(100.0, 100.0 * $throttled / $periods), 1);
+        }
+        // Kills of other processes in this cgroup (another FPM worker): the
+        // kill of the one reporting can't be reported by it.
+        $oom = self::countSince(isset($before['oom']) ? $before['oom'] : null, $after['oom']);
+        if ($oom !== null) {
+            $out['oom_kills'] = $oom;
+        }
+        return $out;
+    }
+
+    // /proc/pressure/<resource>'s "some" line, avg60: the share of the last
+    // minute in which at least one task was waiting. One reading is enough,
+    // so a site sampled during a visit still gets an honest figure.
+    public static function pressureSome($text)
+    {
+        return preg_match('/^some\b[^\n]*\bavg60=([0-9.]+)/m', (string) $text, $m) ? round(min(100.0, (float) $m[1]), 1) : null;
+    }
+
+    public static function pressureFields(callable $read)
+    {
+        $out = array();
+        foreach (array('psi_cpu_pct' => 'cpu', 'psi_mem_pct' => 'memory', 'psi_io_pct' => 'io') as $name => $file) {
+            $value = self::pressureSome($read('/proc/pressure/' . $file));
+            if ($value !== null) {
+                $out[$name] = $value;
+            }
+        }
+        return $out;
+    }
+
+    // TcpExt ListenOverflows from /proc/net/netstat: connections refused
+    // since boot because the accept queue was full. A header line and a
+    // value line.
+    public static function listenOverflows($text)
+    {
+        $lines = explode("\n", (string) $text);
+        for ($i = 0; $i + 1 < count($lines); $i++) {
+            if (strncmp($lines[$i], 'TcpExt:', 7) !== 0 || strncmp($lines[$i + 1], 'TcpExt:', 7) !== 0) {
+                continue;
+            }
+            $at = array_search('ListenOverflows', preg_split('/\s+/', trim($lines[$i])), true);
+            $values = preg_split('/\s+/', trim($lines[$i + 1]));
+            return $at !== false && $at > 0 && isset($values[$at]) ? self::num($values[$at]) : null;
+        }
+        return null;
+    }
+
+    // How full the connection-tracking table is. Only where the firewall
+    // loaded it, and usually unreadable inside a container.
+    public static function conntrackPct(callable $read)
+    {
+        $count = self::num($read('/proc/sys/net/netfilter/nf_conntrack_count'));
+        $max = self::num($read('/proc/sys/net/netfilter/nf_conntrack_max'));
+        return $count !== null && $max > 0 ? round(min(100.0, 100.0 * $count / $max), 1) : null;
+    }
+
+    // PHP-FPM's pool, from fpm_get_status() (PHP 7.3+, FPM only): workers
+    // busy (this one among them: it is still running), the most allowed only
+    // under pm = static (FPM reports no pm.max_children, and every child is
+    // the maximum there), connections waiting for a worker, and how many
+    // times since the last sample the pool wanted another worker and was at
+    // its cap. The pool is the process this row speaks for, so it names the
+    // row (proc_key, kept while the pool runs) and says how long it has run:
+    // an FPM restart shows as proc_uptime_s starting again. $last: what the
+    // state kept; $keep gets what to keep for the next sample.
+    public static function fpmFields($status, array $last, array &$keep, $now = null)
+    {
+        if (!is_array($status) || !isset($status['pool'])) {
+            return array();
+        }
+        $now = $now === null ? time() : (int) $now;
+        $out = array();
+        if (isset($status['active-processes']) && is_numeric($status['active-processes'])) {
+            $out['workers_busy'] = (int) $status['active-processes'];
+        }
+        if (isset($status['process-manager'], $status['total-processes']) && $status['process-manager'] === 'static'
+            && (int) $status['total-processes'] > 0) {
+            $out['workers_max'] = (int) $status['total-processes'];
+        }
+        if (isset($status['listen-queue']) && is_numeric($status['listen-queue'])) {
+            $out['queue_waiting'] = (int) $status['listen-queue'];
+        }
+        $pool = (string) $status['pool'];
+        $start = isset($status['start-time']) ? (int) $status['start-time'] : 0;
+        // Kept per pool and start: two pools (or two containers' pools)
+        // sampling into one state folder each carry on from their own.
+        $id = $pool . '|' . $start;
+        $pools = isset($last['fpm']) && is_array($last['fpm']) ? $last['fpm'] : array();
+        $was = isset($pools[$id]) && is_array($pools[$id]) ? $pools[$id] : null;
+        $reached = isset($status['max-children-reached']) && is_numeric($status['max-children-reached']) ? (int) $status['max-children-reached'] : null;
+        if ($was !== null && $reached !== null) {
+            $maxed = self::countSince(isset($was['reached']) ? $was['reached'] : null, $reached);
+            if ($maxed !== null) {
+                $out['pool_maxed'] = $maxed;
+            }
+        }
+        $key = $was !== null && isset($was['key']) && preg_match('/^[a-f0-9]{16}\z/', (string) $was['key']) ? (string) $was['key'] : bin2hex(random_bytes(8));
+        $keep['fpm'] = self::keepIn($pools, $id, array('reached' => $reached, 'key' => $key));
+        $out['proc_key'] = $key;
+        if ($start > 0 && $now >= $start) {
+            $out['proc_uptime_s'] = $now - $start;
+        }
+        return $out;
+    }
+
+    // How many cgroups, namespaces or pools the state keeps readings of.
+    const KEEP_IDS = 4;
+
+    // Which cgroup a reading is of: its directories, and the inode of one,
+    // since inside a container with its own cgroup namespace every
+    // container's is /sys/fs/cgroup.
+    private static function cgroupId(array $cg)
+    {
+        $dir = $cg['memory'] !== null ? $cg['memory'] : $cg['cpu'];
+        $st = @stat($dir);
+        return $cg['version'] . ':' . $cg['memory'] . ':' . $cg['cpu'] . (is_array($st) ? '#' . $st['dev'] . ':' . $st['ino'] : '');
+    }
+
+    // The reading kept for $id, or null: none, or one from another boot
+    // (a difference of more than two minutes: the clock may have been set).
+    private static function lastOf(array $map, $id, $boot)
+    {
+        if (!isset($map[$id]) || !is_array($map[$id])) {
+            return null;
+        }
+        $was = $map[$id];
+        $then = isset($was['boot']) && is_numeric($was['boot']) ? (int) $was['boot'] : null;
+        return ($boot === null) === ($then === null) && ($boot === null || abs($boot - $then) <= 120) ? $was : null;
+    }
+
+    // $map with $value as $id's, the most recent first, the oldest let go.
+    private static function keepIn(array $map, $id, array $value)
+    {
+        $map = array_filter($map, 'is_array');
+        unset($map[$id]);
+        return array_slice(array((string) $id => $value) + $map, 0, self::KEEP_IDS, true);
+    }
+
+    // The limits pass for one sample, and what to keep for the next one
+    // (array(fields, keep)). $read reads a file ('' when it can't); $fpm is
+    // fpm_get_status()'s answer, read here when not given.
+    public static function limits(array $last, $usable, $memTotalMb = null, $cores = null, $read = null, $fpm = false, $now = null)
+    {
+        $read = $read ?: function ($path) {
+            return self::readText($path);
+        };
+        $now = $now === null ? time() : (int) $now;
+        $out = array();
+        $keep = array();
+        // The state file outlives a reboot, and the kernel's counters don't:
+        // each reading kept says which boot it was taken in, and one from
+        // another is not diffed against. And one state folder can be shared
+        // by processes in several cgroups or network namespaces (the web and
+        // the queue worker containers mounting one storage volume, or two
+        // machines on one network share), each with counters of its own: a
+        // reading is kept per cgroup and per namespace, so none is diffed
+        // against another's, which would make up kills and refused
+        // connections out of the difference between two containers.
+        $uptime = self::hostUptime($read('/proc/uptime'));
+        $boot = $uptime !== null ? $now - $uptime : null;
+        $cg = self::findCgroup($read);
+        $reading = self::cgroupReading($cg, $read);
+        $cgs = isset($last['cg']) && is_array($last['cg']) ? $last['cg'] : array();
+        if ($reading !== null) {
+            $id = self::cgroupId($cg);
+            $was = self::lastOf($cgs, $id, $boot);
+            // The throttled share is a rate: only over an interval of this
+            // cgroup's own that is usable too.
+            $recent = $was !== null && isset($cgs[$id]['at']) && $now - (int) $cgs[$id]['at'] <= self::MAX_CPU_SECONDS;
+            $out += self::cgroupFields($was, $reading, $memTotalMb, $cores, $usable && $recent);
+            $cgs = self::keepIn($cgs, $id, array('periods' => $reading['periods'], 'throttled' => $reading['throttled'],
+                'oom' => $reading['oom'], 'boot' => $boot, 'at' => $now));
+        }
+        if ($cgs) {
+            $keep['cg'] = $cgs;
+        }
+        $out += self::pressureFields($read);
+        $overflows = self::listenOverflows($read('/proc/net/netstat'));
+        $los = isset($last['lo']) && is_array($last['lo']) ? $last['lo'] : array();
+        if ($overflows !== null) {
+            $ns = @readlink('/proc/self/ns/net');
+            $id = is_string($ns) ? $ns : '';
+            $was = self::lastOf($los, $id, $boot);
+            $drops = self::countSince(isset($was['n']) ? $was['n'] : null, $overflows);
+            if ($drops !== null) {
+                $out['listen_drops'] = $drops;
+            }
+            $los = self::keepIn($los, $id, array('n' => $overflows, 'boot' => $boot));
+        }
+        if ($los) {
+            $keep['lo'] = $los;
+        }
+        $conntrack = self::conntrackPct($read);
+        if ($conntrack !== null) {
+            $out['conntrack_pct'] = $conntrack;
+        }
+        if ($fpm === false && function_exists('fpm_get_status')) {
+            $fpm = @fpm_get_status();
+        }
+        $out += self::fpmFields($fpm, $last, $keep, $now);
+        // A sample taken outside FPM (a command-line cron run) keeps the
+        // pool's, so the pool's key and count carry on past it.
+        if (!isset($keep['fpm']) && isset($last['fpm']) && is_array($last['fpm'])) {
+            $keep['fpm'] = $last['fpm'];
+        }
+        return array($out, $keep);
+    }
+
     // Is a sample due? PHP only runs while a request does, so "about once a
     // minute" means "on the first request after a minute has passed".
     public function due()
@@ -417,7 +820,7 @@ class Resources
     {
         $now = $now === null ? time() : (int) $now;
         $file = $this->core->dir() . '/resources.state';
-        $state = json_decode(self::readText($file, 4096), true);
+        $state = json_decode(self::readText($file, 16384), true);
         $fields = self::cpuFields(self::readText('/proc/stat'));
         $disk = self::diskCounters(self::readText('/proc/diskstats'));
         $net = self::netCounters(self::readText('/proc/net/dev'));
@@ -467,24 +870,6 @@ class Resources
                 }
             }
         }
-        if ($fields !== null) {
-            // Beside it and moved into place, so a request reading it never
-            // sees half a sample.
-            $tmp = $file . '.' . getmypid() . '.' . bin2hex(random_bytes(4)) . '.tmp';
-            if (@file_put_contents($tmp, json_encode(array(
-                'cpu' => $fields,
-                'disk' => $disk,
-                'net' => $net,
-                'at' => $now,
-            ))) !== false) {
-                @chmod($tmp, 0600);
-                if (!@rename($tmp, $file)) {
-                    @unlink($tmp);
-                }
-            }
-        } else {
-            @touch($file);
-        }
         $cores = self::cores();
         if ($cores) {
             $row['cpu_cores'] = $cores;
@@ -510,6 +895,35 @@ class Resources
         $uptime = self::hostUptime(self::readText('/proc/uptime'));
         if ($uptime !== null) {
             $row['host_uptime_s'] = $uptime;
+        }
+        list($limits, $keep) = self::limits(
+            is_array($state) && isset($state['lim']) && is_array($state['lim']) ? $state['lim'] : array(),
+            $usable,
+            isset($row['mem_total_mb']) ? $row['mem_total_mb'] : null,
+            $cores ?: null,
+            null,
+            false,
+            $now
+        );
+        $row += $limits;
+        if ($fields !== null || $keep) {
+            // Beside it and moved into place, so a request reading it never
+            // sees half a sample.
+            $tmp = $file . '.' . getmypid() . '.' . bin2hex(random_bytes(4)) . '.tmp';
+            if (@file_put_contents($tmp, json_encode(array(
+                'cpu' => $fields,
+                'disk' => $disk,
+                'net' => $net,
+                'lim' => $keep,
+                'at' => $now,
+            ))) !== false) {
+                @chmod($tmp, 0600);
+                if (!@rename($tmp, $file)) {
+                    @unlink($tmp);
+                }
+            }
+        } else {
+            @touch($file);
         }
         // Nothing but a minute label is not a sample.
         return count($row) > 1 ? $row : null;

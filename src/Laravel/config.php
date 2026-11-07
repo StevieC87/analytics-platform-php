@@ -25,6 +25,15 @@ return [
     // With it, every database query's time (Health → Server speed → Queries),
     // its values taken out before anything is counted.
     'queries' => env('ANALYTICS_QUERIES', true),
+    // With it, how long each route waited on other services through the Http
+    // client (Health → Server speed → Calls), by the host it called; only the host is sent.
+    'calls' => env('ANALYTICS_CALLS', true),
+    // With it, each queue's backlog once a minute, read by queue:work, and the
+    // jobs added and finished (Health → Server speed → Jobs).
+    'queues' => env('ANALYTICS_QUEUES', true),
+    // More queues to read than the ones the worker processes:
+    // "redis:emails,default" (connection:queue, or a queue on the default connection).
+    'watch_queues' => env('ANALYTICS_WATCH_QUEUES', ''),
     // The Composer packages and PHP version, once a day, for the Security check.
     'inventory' => env('ANALYTICS_INVENTORY', true),
     // How the server is set up, once a day, for the Security check: php.ini

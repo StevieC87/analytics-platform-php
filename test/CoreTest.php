@@ -86,6 +86,13 @@ $scripted->append('test', array('n' => 3), 1000000);
 $scripted->answers = array(400);
 $scripted->drain('test', 60, true, $send);
 check('a batch the collector refused is not kept', !$scripted->waiting('test'));
+// A writer killed mid-line left no newline: the next line starts on its own.
+file_put_contents($scripted->dir() . '/test.jsonl', "{\"n\":4}\n{\"n\":5,\"half");
+$scripted->append('test', array('n' => 6), 1000000);
+$scripted->sent = array();
+$scripted->drain('test', 60, true, $send);
+check('a half line left by a killed writer loses only itself', count($scripted->sent) === 1
+    && $scripted->sent[0][1]['rows'] === array(array('n' => 4), array('n' => 6)));
 
 // A 304 keeps the interval the dashboard last gave; a failure retries sooner.
 $scripted->writePhp('switches.php', array('fetched' => 0, 'sync' => 600, 'etag' => '"v1"', 'modules' => array()));

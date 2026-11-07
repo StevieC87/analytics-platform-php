@@ -98,14 +98,9 @@ class FirewallMiddleware
         if ($page !== null) {
             return response($page['body'], $page['status'], $page['headers']);
         }
-        $response = response($decision['status'] === 429 ? 'Too Many Requests' : 'Forbidden', $decision['status'])
-            ->header('Content-Type', 'text/plain; charset=utf-8')
-            ->header('Cache-Control', 'no-store');
-        $rules = $firewall->status();
-        if ($decision['status'] === 429 && !empty($rules['rate'])) {
-            $response->header('Retry-After', (string) $rules['rate']['window']);
-        }
-        return $response;
+        // A page limit's Retry-After is its own window, not the rate's.
+        $answer = $firewall->blockedResponse($decision);
+        return response($answer['body'], $answer['status'], $answer['headers']);
     }
 
     // Maintenance mode's page, else the app.
@@ -138,17 +133,47 @@ class FirewallMiddleware
             if ($route) {
                 $this->platform->setRoute('/' . ltrim($route->uri(), '/'));
             }
+            $status = null;
             if (method_exists($response, 'getStatusCode')) {
                 $status = (int) $response->getStatusCode();
                 if (!headers_sent() || http_response_code() !== $status) {
                     @http_response_code($status);
                 }
             }
+            // A static-looking request Laravel routed to a page
+            // ("search/{q}" took "/search/x.css") counts toward the rate and
+            // the page limits after all (firewall.md, `rate`).
+            $firewall = $this->platform->firewall();
+            if ($firewall) {
+                $type = is_object($response) && isset($response->headers) ? $response->headers->get('Content-Type') : null;
+                $firewall->markRouted(self::routedToPage($route), $type);
+                // Counted now, by the response's own status: under Octane no
+                // shutdown follows the request and http_response_code() is
+                // the worker's, not this response's.
+                $firewall->countStatic($status);
+            }
             $this->platform->recordAndSend();
         } finally {
             $_SERVER = $server;
         }
         $this->reset();
+    }
+
+    // Whether $route (the request's, or null) is a page of the app's: not a
+    // route that is itself a file's ("avatars/{id}.png"), nor the ones
+    // Laravel and Livewire serve files from (storage/ for the local disk's
+    // files, livewire/ for its script and uploaded previews): an image on a
+    // page is a request to one.
+    public static function routedToPage($route)
+    {
+        if (!$route || !method_exists($route, 'uri')) {
+            return false;
+        }
+        $uri = '/' . ltrim((string) $route->uri(), '/');
+        if (strpos($uri, '/storage/') === 0 || strpos($uri, '/livewire/') === 0 || strpos($uri, '/livewire-') === 0) {
+            return false;
+        }
+        return !\AnalyticsPlatform\Firewall::isStatic($uri);
     }
 
     // A long-lived worker (Octane) serves the next visitor with this same

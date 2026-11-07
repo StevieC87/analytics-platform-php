@@ -1,24 +1,30 @@
 <?php
-// Database queries (protocol in sdk/protocols/queries.md): the half of Server
-// speed that says *why* a route is slow. Every query the site's own code runs
-// is timed through the database library's public hook, its values taken out
-// (normalize(), the collector's queryText.js ported), and added to a small
-// map for the request it ran in: per database and statement, how many ran,
-// how many failed, their total and slowest time and a count per time bucket.
+// Database queries and outgoing calls (protocols in sdk/protocols/queries.md
+// and calls.md): the half of Server speed that says *why* a route is slow.
+// Every query the site's own code runs is timed through the database
+// library's public hook, its values taken out (normalize(), the collector's
+// queryText.js ported), and added to a small map for the request it ran in:
+// per database and statement, how many ran, how many failed, their total and
+// slowest time and a count per time bucket. Every outgoing HTTP call is
+// added the same way, per call method and host (only the host: a path
+// carries IDs and keys).
 //
-// PHP handles one request per process at a time, so the request's map lives
-// here. When the request ends, the performance module records its method and
-// route, and the map is written next to them as one line of queries.jsonl;
-// once a minute one request adds the lines up per minute, method, route,
-// database and statement and sends them to POST /events/server-queries, as
-// the performance module does with requests.jsonl. A queue job's queries go
-// under the job's own row, and a query outside any request or job (a cron
-// script, a worker between jobs) under JOB "(background)".
+// PHP handles one request per process at a time, so the request's maps live
+// here. When the request ends they are written into the request's own line
+// of requests.jsonl (Performance::recordRequest), and the performance module,
+// which adds those lines up once a minute, hands each line's maps back under
+// the method and route it filed the request under — the very route, so a
+// route Server speed folded into "(other)" past its cap has its queries and
+// calls there too (#373) — to be sent to POST /events/server-queries and
+// /events/server-calls. A queue job's go under the job's own row the same
+// way, and those outside any request or job (a cron script, a worker between
+// jobs) under JOB "(background)", through queries.jsonl.
 //
-// The hooks, each recording a query once:
+// The query hooks, each recording a query once:
 // - Laravel: QueryExecuted (DB::listen), in the service provider.
 // - Symfony: Doctrine DBAL's middleware (Symfony\QueryMiddleware).
-// - Plain PHP: new TimedPdo(...) instead of new PDO(...).
+// - Plain PHP: new TimedPdo(...) instead of new PDO(...), and
+//   TimedClickHouse for smi2/phpclickhouse.
 // - MongoDB: the mongodb extension's global command subscriber, on its own
 //   whenever the extension is loaded (Laravel's mongodb connections are
 //   left to it, so they aren't counted twice).
@@ -27,9 +33,15 @@
 // exists (WordPress's drop-in runs before the plugins load): those queries
 // wait here for the first one.
 //
+// The call hooks, the ones the error trail already uses: Laravel's Http
+// client events, Symfony's HttpClientBreadcrumbs, the plugin's
+// pre_http_request/http_api_debug, and Platform::guzzleMiddleware() for
+// Guzzle. Each reports through Platform::recordCall().
+//
 // No values ever leave the server: literals are replaced by "?" before a
 // query is counted, and bound parameters are never read. Rides on the
-// performance module's switch; 'queries' => false leaves it out.
+// performance module's switch; 'queries' => false leaves queries out and
+// 'calls' => false the calls.
 
 namespace AnalyticsPlatform;
 
@@ -40,25 +52,27 @@ class Queries
     // WordPress's drop-in loads this file before Performance exists.
     const BUCKET_EDGES_MS = array(5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000);
     const FLUSH_EVERY = 60;
-    // A request's distinct statements; past it new ones go under "(other)".
+    // A request's distinct statements (or hosts); past it new ones go under "(other)".
     const MAX_PER_REQUEST = 50;
-    // Keys in a minute: past MAX_KEYS new statements go under "(other)",
-    // past HARD_MAX_KEYS nothing new is kept.
+    // Keys in a minute: past MAX_KEYS new statements (or hosts) go under
+    // "(other)", past HARD_MAX_KEYS nothing new is kept.
     const MAX_KEYS = 200;
     const HARD_MAX_KEYS = 300;
     const MAX_ROWS = 500;
-    const SPOOL_MAX = 5000000; // bytes waiting; more requests' queries aren't recorded
-    // A request's line holds up to 50 statements, so a busy site fills the
-    // spool far sooner than requests.jsonl: past this it is sent at once
-    // rather than at the next minute.
+    const SPOOL_MAX = 5000000; // bytes waiting; more background lines aren't recorded
+    // Past this the background spool is sent at once rather than at the
+    // next minute.
     const SEND_BYTES = 1000000;
     const MAX_STATEMENT = 1000;
     const OTHER = '(other)';
     const BACKGROUND = '(background)';
-    const DATABASES = array('postgresql', 'mysql', 'mariadb', 'sqlite', 'mssql', 'oracle', 'mongodb', 'other');
+    const DATABASES = array('postgresql', 'mysql', 'mariadb', 'sqlite', 'mssql', 'oracle', 'clickhouse', 'mongodb', 'other');
     // Mongo's connection chatter, never a query of the site's.
     const MONGO_CHATTER = array('hello', 'isMaster', 'ismaster', 'ping', 'buildInfo', 'saslStart', 'saslContinue',
         'getMore', 'endSessions', 'killCursors', 'getLastError');
+    // The two kinds, by the key their maps have in a line: q is queries
+    // (db, statement), c is calls (call_method, host).
+    const PATHS = array('q' => '/events/server-queries', 'c' => '/events/server-calls');
 
     // The module the hooks report to: the last one built.
     private static $active = null;
@@ -72,32 +86,62 @@ class Queries
 
     private $core;
     private $options;
-    private $request = array();
-    // The jobs running, innermost last: each its own map.
+    // Each holder: array('q' => map, 'c' => map).
+    private $request;
+    // The jobs running, innermost last: a holder each.
     private $jobs = array();
-    private $background = array();
+    private $background;
     private $backgroundMinute = 0;
     private $shutdown = false;
     // Whether a query outside a job belongs to a request: a web server's
     // process, or a worker serving requests once beginRequest() says so.
     private $serving;
+    private $queriesOn;
+    private $callsOn;
+    // The collector's address as a call would be written (normalAddress()):
+    // the package's own calls are never counted.
+    private $own;
 
-    // Options: server_name (default the host name).
+    // Options: server_name (default the host name); queries and calls
+    // (false leaves that kind out).
     public function __construct(Core $core, array $options = array())
     {
         $this->core = $core;
-        $this->options = $options + array('server_name' => function_exists('gethostname') ? gethostname() : '');
+        $this->options = $options + array('server_name' => function_exists('gethostname') ? gethostname() : '', 'queries' => true, 'calls' => true);
+        $this->queriesOn = $this->options['queries'] !== false && $this->options['queries'] !== null;
+        $this->callsOn = $this->options['calls'] !== false && $this->options['calls'] !== null;
+        $this->own = self::normalAddress((string) $core->opt('endpoint'));
         $this->serving = PHP_SAPI !== 'cli' && PHP_SAPI !== 'phpdbg';
-        $this->request = self::$early;
-        self::$early = array();
-        self::$active = $this;
-        self::watchMongo();
+        $this->request = self::holder();
+        $this->background = self::holder();
+        // The query hooks report to the last module that times queries.
+        if ($this->queriesOn) {
+            $this->request['q'] = self::$early;
+            self::$early = array();
+            self::$active = $this;
+            self::watchMongo();
+        }
+    }
+
+    private static function holder()
+    {
+        return array('q' => array(), 'c' => array());
+    }
+
+    public function queriesOn()
+    {
+        return $this->queriesOn;
+    }
+
+    public function callsOn()
+    {
+        return $this->callsOn;
     }
 
     // ---- Recording --------------------------------------------------------------
 
-    // What every hook calls: a query that took $ms and threw (or returned
-    // false) when $failed.
+    // What every query hook calls: a query that took $ms and threw (or
+    // returned false) when $failed.
     public static function report($db, $sql, $ms, $failed = false)
     {
         if (self::$active !== null) {
@@ -142,7 +186,7 @@ class Queries
     public function record($db, $sql, $ms, $failed = false)
     {
         try {
-            if (!$this->core->isOn('performance')) {
+            if (!$this->queriesOn || !$this->core->isOn('performance')) {
                 return;
             }
             $db = self::databaseOf($db);
@@ -150,80 +194,111 @@ class Queries
             if ($statement === '') {
                 return;
             }
-            $ms = max(0.0, (float) $ms);
-            if ($this->jobs) {
-                self::add($this->jobs[count($this->jobs) - 1], $db, $statement, $ms, $failed, self::MAX_PER_REQUEST);
-            } elseif ($this->serving) {
-                self::add($this->request, $db, $statement, $ms, $failed, self::MAX_PER_REQUEST);
-            } else {
-                $this->addBackground($db, $statement, $ms, $failed);
-            }
+            $this->put('q', $db, $statement, max(0.0, (float) $ms), $failed);
         } catch (\Throwable $e) {
             // not counted
         }
     }
 
+    // An outgoing HTTP call that took $ms from being sent to its answer's
+    // headers; $status is the answer's, 0 when none came. No answer or a
+    // 5xx is a failed call; a 4xx is the other side's answer. Only the host
+    // is kept, and the package's own calls to the collector are left out.
+    // Never throws, like record().
+    public function recordCall($method, $url, $ms, $status)
+    {
+        try {
+            if (!$this->callsOn || !$this->core->isOn('performance')) {
+                return;
+            }
+            $method = strtoupper(trim((string) $method));
+            if (!preg_match('/^[A-Z]{1,10}\z/', $method) || $this->isOwn((string) $url)) {
+                return;
+            }
+            $host = self::hostOf((string) $url);
+            if ($host === '') {
+                return;
+            }
+            $status = (int) $status;
+            $this->put('c', $method, $host, max(0.0, (float) $ms), !($status > 0 && $status < 500));
+        } catch (\Throwable $e) {
+            // not counted
+        }
+    }
+
+    // Into the innermost job, else the request, else the background.
+    private function put($kind, $a, $b, $ms, $failed)
+    {
+        if ($this->jobs) {
+            self::add($this->jobs[count($this->jobs) - 1][$kind], $a, $b, $ms, $failed, self::MAX_PER_REQUEST);
+        } elseif ($this->serving) {
+            self::add($this->request[$kind], $a, $b, $ms, $failed, self::MAX_PER_REQUEST);
+        } else {
+            $this->addBackground($kind, $a, $b, $ms, $failed);
+        }
+    }
+
     // A worker that serves many requests from one process (Octane,
     // RoadRunner, FrankenPHP) starting the next one: nothing of the last is
-    // kept, and queries outside a job belong to requests from now on.
+    // kept, and queries and calls outside a job belong to requests from now on.
     public function beginRequest()
     {
-        $this->request = array();
+        $this->request = self::holder();
         $this->serving = true;
     }
 
-    // The request ended. $recorded: the method, route and time the
-    // performance module recorded it under (Performance::recordRequest), so
-    // the dashboard can join the two; null when it recorded nothing (the
-    // visitor went away), and the queries go with it; false when the request
-    // isn't one it times (WordPress's cron), and they count as background.
-    public function endRequest($recorded)
+    // The request's queries and calls, taken for its line in requests.jsonl
+    // (Performance::recordRequest): array('q' => rows, 'c' => rows), each
+    // only when there are some.
+    public function takeRequest()
     {
-        $map = $this->request;
-        $this->request = array();
-        $this->file($map, $recorded);
+        $holder = $this->request;
+        $this->request = self::holder();
+        return $this->core->isOn('performance') ? self::lineOf($holder) : array();
+    }
+
+    // The request ended without takeRequest(): it isn't one the performance
+    // module times (WordPress's cron), so what ran in it is background work.
+    public function endRequest()
+    {
+        $holder = $this->request;
+        $this->request = self::holder();
+        if (!$holder['q'] && !$holder['c']) {
+            return;
+        }
+        foreach ($holder as $kind => $map) {
+            foreach ($map as $row) {
+                $this->mergeBackground($kind, $row);
+            }
+        }
+        $this->saveBackground();
     }
 
     public function startJob()
     {
-        $this->jobs[] = array();
+        $this->jobs[] = self::holder();
     }
 
-    // The job ended. $recorded: what the performance module recorded the run
-    // under (Performance::recordJob), as endRequest's.
-    public function endJob($recorded)
+    // The innermost job's queries and calls, for its line in requests.jsonl
+    // (Performance::recordJob), as takeRequest()'s.
+    public function takeJob()
     {
         if (!$this->jobs) {
-            return;
+            return array();
         }
-        $this->file(array_pop($this->jobs), $recorded);
+        $holder = array_pop($this->jobs);
+        return $this->core->isOn('performance') ? self::lineOf($holder) : array();
     }
 
-    // A finished request's or job's queries, under what it was recorded as.
-    private function file(array $map, $recorded)
+    private static function add(array &$map, $a, $b, $ms, $failed, $cap)
     {
-        if (!$map) {
-            return;
-        }
-        if ($recorded === false) {
-            foreach ($map as $row) {
-                $this->mergeBackground($row);
-            }
-            $this->saveBackground();
-        } elseif (is_array($recorded) && isset($recorded['t'], $recorded['m'], $recorded['r'])) {
-            $this->save($recorded['t'], $recorded['m'], $recorded['r'], $map);
-        }
-    }
-
-    private static function add(array &$map, $db, $statement, $ms, $failed, $cap)
-    {
-        $key = $db . "\0" . $statement;
+        $key = $a . "\0" . $b;
         if (!isset($map[$key]) && count($map) >= $cap) {
-            $statement = self::OTHER;
-            $key = $db . "\0" . $statement;
+            $b = self::OTHER;
+            $key = $a . "\0" . $b;
         }
         if (!isset($map[$key])) {
-            $map[$key] = array($db, $statement, 0, 0, 0.0, 0.0, array_fill(0, count(self::BUCKET_EDGES_MS) + 1, 0));
+            $map[$key] = array($a, $b, 0, 0, 0.0, 0.0, array_fill(0, count(self::BUCKET_EDGES_MS) + 1, 0));
         }
         $map[$key][2]++;
         if ($failed) {
@@ -238,32 +313,41 @@ class Queries
 
     // Outside a request or job: kept per minute in memory, written out when
     // the minute changes and at the end of the script.
-    private function addBackground($db, $statement, $ms, $failed)
+    private function addBackground($kind, $a, $b, $ms, $failed)
     {
         $minute = (int) (floor(time() / 60) * 60);
-        if ($this->background && $minute !== $this->backgroundMinute) {
+        if (($this->background['q'] || $this->background['c']) && $minute !== $this->backgroundMinute) {
             $this->saveBackground();
         }
         $this->backgroundMinute = $minute;
         // The minute's own caps apply when the lines are added up.
-        self::add($this->background, $db, $statement, $ms, $failed, self::HARD_MAX_KEYS);
+        self::add($this->background[$kind], $a, $b, $ms, $failed, self::HARD_MAX_KEYS);
         if (!$this->shutdown) {
             $this->shutdown = true;
             register_shutdown_function(array($this, 'onShutdown'));
         }
     }
 
-    private function mergeBackground(array $row)
+    // A worker between jobs keeps its background minute in memory until the
+    // next query: written out once that minute is over, at its next flush.
+    private function saveFinishedBackground()
     {
-        if (!$this->background) {
+        if (($this->background['q'] || $this->background['c']) && $this->backgroundMinute !== (int) (floor(time() / 60) * 60)) {
+            $this->saveBackground();
+        }
+    }
+
+    private function mergeBackground($kind, array $row)
+    {
+        if (!$this->background['q'] && !$this->background['c']) {
             $this->backgroundMinute = (int) (floor(time() / 60) * 60);
         }
         $key = $row[0] . "\0" . $row[1];
-        if (!isset($this->background[$key])) {
-            $this->background[$key] = $row;
+        if (!isset($this->background[$kind][$key])) {
+            $this->background[$kind][$key] = $row;
             return;
         }
-        $into = &$this->background[$key];
+        $into = &$this->background[$kind][$key];
         $into[2] += $row[2];
         $into[3] += $row[3];
         $into[4] += $row[4];
@@ -275,10 +359,10 @@ class Queries
 
     private function saveBackground()
     {
-        $map = $this->background;
-        $this->background = array();
-        if ($map) {
-            $this->save($this->backgroundMinute ?: time(), 'JOB', self::BACKGROUND, $map);
+        $holder = $this->background;
+        $this->background = self::holder();
+        if ($holder['q'] || $holder['c']) {
+            $this->save($this->backgroundMinute ?: time(), 'JOB', self::BACKGROUND, $holder);
         }
     }
 
@@ -298,16 +382,32 @@ class Queries
         }
     }
 
-    private function save($at, $method, $route, array $map)
+    // A holder as a line's fields: rows of (a, b, count, errors, sum, max,
+    // buckets), rounded to the microsecond.
+    private static function lineOf(array $holder)
+    {
+        $line = array();
+        foreach ($holder as $kind => $map) {
+            $rows = array();
+            foreach ($map as $row) {
+                $rows[] = array($row[0], $row[1], $row[2], $row[3], round($row[4], 3), round($row[5], 3), $row[6]);
+            }
+            if ($rows) {
+                $line[$kind] = $rows;
+            }
+        }
+        return $line;
+    }
+
+    private function save($at, $method, $route, array $holder)
     {
         if (!$this->core->isOn('performance') || !$this->core->ensureDir()) {
             return;
         }
-        $rows = array();
-        foreach ($map as $row) {
-            $rows[] = array($row[0], $row[1], $row[2], $row[3], round($row[4], 3), round($row[5], 3), $row[6]);
+        $line = self::lineOf($holder);
+        if ($line) {
+            $this->core->append('queries', array('t' => (int) $at, 'm' => (string) $method, 'r' => (string) $route) + $line, self::SPOOL_MAX);
         }
-        $this->core->append('queries', array('t' => (int) $at, 'm' => (string) $method, 'r' => (string) $route, 'q' => $rows), self::SPOOL_MAX);
     }
 
     private static function bucketOf($ms)
@@ -320,13 +420,66 @@ class Queries
         return count(self::BUCKET_EDGES_MS);
     }
 
+    // ---- Calls: the host ----------------------------------------------------------
+
+    // The host of a call as calls.md stores it: lower case, with its port
+    // when it isn't the scheme's own; '' when the address has none, or one
+    // the collector would refuse.
+    public static function hostOf($url)
+    {
+        $parts = @parse_url(trim((string) $url));
+        if (!is_array($parts) || !isset($parts['host']) || $parts['host'] === '') {
+            return '';
+        }
+        $host = strtolower($parts['host']);
+        if (preg_match('/[^\x00-\x7F]/', $host)) {
+            $ascii = function_exists('idn_to_ascii') ? @idn_to_ascii($host, 0, defined('INTL_IDNA_VARIANT_UTS46') ? INTL_IDNA_VARIANT_UTS46 : 0) : false;
+            if (!is_string($ascii) || $ascii === '') {
+                return '';
+            }
+            $host = strtolower($ascii);
+        }
+        // An IPv6 address keeps its brackets, as a URL writes it.
+        if (strpos($host, ':') !== false && $host[0] !== '[') {
+            $host = '[' . $host . ']';
+        }
+        $scheme = isset($parts['scheme']) ? strtolower($parts['scheme']) : '';
+        $defaults = array('http' => 80, 'https' => 443, 'ws' => 80, 'wss' => 443);
+        if (isset($parts['port']) && !(isset($defaults[$scheme]) && $defaults[$scheme] === (int) $parts['port'])) {
+            $host .= ':' . (int) $parts['port'];
+        }
+        return preg_match('/^[a-z0-9._\-\[\]:]{1,255}\z/', $host) ? $host : '';
+    }
+
+    // scheme://host[:port]/path, without the query, the fragment or a
+    // trailing slash, so two ways of writing one address compare equal.
+    private static function normalAddress($url)
+    {
+        $host = self::hostOf($url);
+        if ($host === '') {
+            return '';
+        }
+        $parts = @parse_url(trim((string) $url));
+        $scheme = isset($parts['scheme']) ? strtolower($parts['scheme']) : '';
+        $path = isset($parts['path']) ? rtrim($parts['path'], '/') : '';
+        return $scheme . '://' . $host . $path;
+    }
+
+    // The package's own call to the collector: its address or below it.
+    private function isOwn($url)
+    {
+        if ($this->own === '') {
+            return false;
+        }
+        $address = self::normalAddress($url);
+        return $address === $this->own || strpos($address, $this->own . '/') === 0;
+    }
+
     // ---- Sending ----------------------------------------------------------------
 
     private function big()
     {
-        $file = $this->core->dir() . '/queries.jsonl';
-        clearstatcache(true, $file);
-        return is_file($file) && filesize($file) > self::SEND_BYTES;
+        return $this->core->spoolOver('queries', self::SEND_BYTES);
     }
 
     public function due()
@@ -334,48 +487,86 @@ class Queries
         return $this->core->waiting('queries') && ($this->core->sendDue('queries', self::FLUSH_EVERY) || $this->big());
     }
 
-    // Adds up the recorded lines and sends them, once a minute.
+    // Sends the background lines (queries.jsonl), added up, once a minute.
     public function flush($force = false)
     {
+        $this->saveFinishedBackground();
         $this->core->drain('queries', $this->big() ? 0 : self::FLUSH_EVERY, $force, function (array $recorded) {
-            $rows = array();
-            $keys = array();
+            $lines = array();
             foreach ($recorded as $line) {
-                if (!isset($line['t'], $line['m'], $line['r'], $line['q']) || !is_array($line['q'])) {
+                if (!isset($line['t'], $line['m'], $line['r'])) {
                     continue;
                 }
-                $minute = (int) (floor($line['t'] / 60) * 60);
-                $method = Performance::method($line['m']);
-                $route = (string) $line['r'];
-                foreach ($line['q'] as $q) {
-                    if (!is_array($q) || count($q) < 7 || !is_array($q[6])) {
+                $lines[] = array((int) (floor($line['t'] / 60) * 60), Performance::method($line['m']), (string) $line['r'],
+                    isset($line['q']) ? $line['q'] : null, isset($line['c']) ? $line['c'] : null);
+            }
+            $this->send($lines);
+        });
+    }
+
+    // Requests' and jobs' queries and calls, from the performance module's
+    // send: each array(minute, method, route, queries, calls) exactly as it
+    // filed the request, so the dashboard can join the two.
+    public function sendTimed(array $lines)
+    {
+        try {
+            $this->send($lines);
+        } catch (\Throwable $e) {
+            // never break the site
+        }
+    }
+
+    // Adds the lines up per minute, method, route and the kind's two key
+    // fields, with the minute's caps, and posts each kind to its endpoint.
+    private function send(array $lines)
+    {
+        foreach (self::PATHS as $kind => $path) {
+            if (($kind === 'q' && !$this->queriesOn) || ($kind === 'c' && !$this->callsOn)) {
+                continue;
+            }
+            $rows = array();
+            $keys = array();
+            foreach ($lines as $line) {
+                $items = $line[$kind === 'q' ? 3 : 4];
+                if (!is_array($items)) {
+                    continue;
+                }
+                list($minute, $method, $route) = $line;
+                foreach ($items as $item) {
+                    if (!is_array($item) || count($item) < 7 || !is_array($item[6])) {
                         continue;
                     }
-                    $db = self::databaseOf($q[0]);
-                    $statement = (string) $q[1];
-                    $key = json_encode(array($minute, $method, $route, $db, $statement));
+                    if ($kind === 'q') {
+                        $a = self::databaseOf($item[0]);
+                    } else {
+                        $a = strtoupper((string) $item[0]);
+                        if (!preg_match('/^[A-Z]{1,10}\z/', $a)) {
+                            continue;
+                        }
+                    }
+                    $b = (string) $item[1];
+                    $key = json_encode(array($minute, $method, $route, $a, $b));
                     $count = isset($keys[$minute]) ? $keys[$minute] : 0;
                     if (!isset($rows[$key]) && $count >= self::MAX_KEYS) {
-                        $statement = self::OTHER;
-                        $key = json_encode(array($minute, $method, $route, $db, $statement));
+                        $b = self::OTHER;
+                        $key = json_encode(array($minute, $method, $route, $a, $b));
                     }
                     if (!isset($rows[$key]) && $count >= self::HARD_MAX_KEYS) {
                         continue;
                     }
                     if (!isset($rows[$key])) {
                         $keys[$minute] = $count + 1;
-                        $rows[$key] = array(
-                            'minute' => gmdate('Y-m-d\TH:i:s.000\Z', $minute), 'method' => $method, 'route' => $route,
-                            'db' => $db, 'statement' => $statement, 'count' => 0, 'errors' => 0, 'sum_ms' => 0.0, 'max_ms' => 0.0,
-                            'buckets' => array_fill(0, count(self::BUCKET_EDGES_MS) + 1, 0),
-                        );
+                        $rows[$key] = array('minute' => gmdate('Y-m-d\TH:i:s.000\Z', $minute), 'method' => $method, 'route' => $route)
+                            + ($kind === 'q' ? array('db' => $a, 'statement' => $b) : array('host' => $b, 'call_method' => $a))
+                            + array('count' => 0, 'errors' => 0, 'sum_ms' => 0.0, 'max_ms' => 0.0,
+                                'buckets' => array_fill(0, count(self::BUCKET_EDGES_MS) + 1, 0));
                     }
-                    $rows[$key]['count'] += (int) $q[2];
-                    $rows[$key]['errors'] += (int) $q[3];
-                    $rows[$key]['sum_ms'] += (float) $q[4];
-                    $rows[$key]['max_ms'] = max($rows[$key]['max_ms'], (float) $q[5]);
+                    $rows[$key]['count'] += (int) $item[2];
+                    $rows[$key]['errors'] += (int) $item[3];
+                    $rows[$key]['sum_ms'] += (float) $item[4];
+                    $rows[$key]['max_ms'] = max($rows[$key]['max_ms'], (float) $item[5]);
                     foreach ($rows[$key]['buckets'] as $i => $n) {
-                        $rows[$key]['buckets'][$i] = $n + (isset($q[6][$i]) ? (int) $q[6][$i] : 0);
+                        $rows[$key]['buckets'][$i] = $n + (isset($item[6][$i]) ? (int) $item[6][$i] : 0);
                     }
                 }
             }
@@ -383,15 +574,17 @@ class Queries
                 $rows[$key]['sum_ms'] = round($row['sum_ms'], 1);
                 $rows[$key]['max_ms'] = round($row['max_ms'], 1);
             }
+            // Both kinds retry through the queries spool: a kept batch
+            // carries its own path.
             foreach (array_chunk(array_values($rows), self::MAX_ROWS) as $batch) {
-                $this->core->post('queries', '/events/server-queries', array(
+                $this->core->post('queries', $path, array(
                     'site_id' => (string) $this->core->opt('site_id'),
                     'server_name' => substr((string) $this->options['server_name'], 0, 100),
                     'runtime' => 'PHP ' . PHP_VERSION,
                     'rows' => $batch,
                 ), 'bearer');
             }
-        });
+        }
     }
 
     // ---- MongoDB ----------------------------------------------------------------
@@ -508,7 +701,11 @@ class Queries
 
     public static function databaseOf($db)
     {
-        $name = strtolower(is_scalar($db) ? (string) $db : '');
+        // Lower case as JavaScript's toLowerCase gives it for these names:
+        // ASCII whatever the locale, and the Kelvin sign is a k. No other
+        // non-ASCII character lower-cases to a letter of a name.
+        $name = strtr(str_replace("\xE2\x84\xAA", 'k', is_scalar($db) ? (string) $db : ''),
+            'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz');
         return in_array($name, self::DATABASES, true) ? $name : 'other';
     }
 
@@ -523,6 +720,7 @@ class Queries
             'sqlite' => 'sqlite', 'pdo_sqlite' => 'sqlite', 'sqlite3' => 'sqlite',
             'sqlsrv' => 'mssql', 'pdo_sqlsrv' => 'mssql', 'dblib' => 'mssql', 'mssql' => 'mssql',
             'oci' => 'oracle', 'oci8' => 'oracle', 'pdo_oci' => 'oracle', 'oracle' => 'oracle',
+            'clickhouse' => 'clickhouse', 'pdo_clickhouse' => 'clickhouse',
             'mongodb' => 'mongodb',
         );
         return isset($map[$name]) ? $map[$name] : 'other';
@@ -538,7 +736,19 @@ class Queries
             return $text;
         }
         $db = self::databaseOf($db);
-        return self::cut($db === 'mongodb' ? self::mongoStatement($text) : self::sqlShape($text, $db));
+        if ($db === 'mongodb') {
+            $shaped = self::mongoStatement($text);
+        } elseif ($db === 'other' && strpos($text, '\\') !== false) {
+            // A database we don't know may or may not take a backslash as an
+            // escape, and each reading leaks what the other hides. When they
+            // disagree the query keeps its timing under (other) and its text
+            // is left out.
+            $escaped = self::sqlShape($text, $db, false);
+            $shaped = $escaped === self::sqlShape($text, $db, true) ? $escaped : self::OTHER;
+        } else {
+            $shaped = self::sqlShape($text, $db);
+        }
+        return self::cut($shaped);
     }
 
     // normalize(), remembered for the statements a request runs again.
@@ -605,17 +815,18 @@ class Queries
 
     // The end of a quoted run starting at $start (the opening quote): the
     // index after the closing quote, or the text's length. A doubled quote
-    // and a backslash both escape.
-    private static function quoteEnd($sql, $start, $quote)
+    // escapes, and a backslash too unless $backslash is false.
+    private static function quoteEnd($sql, $start, $quote, $backslash = true)
     {
         $n = strlen($sql);
         $i = $start + 1;
+        $stops = $backslash ? $quote . '\\' : $quote;
         while ($i < $n) {
-            $i += strcspn($sql, $quote . '\\', $i);
+            $i += strcspn($sql, $stops, $i);
             if ($i >= $n) {
                 break;
             }
-            if ($sql[$i] === '\\') {
+            if ($backslash && $sql[$i] === '\\') {
                 $i += 2;
             } elseif ($i + 1 < $n && $sql[$i + 1] === $quote) {
                 $i += 2;
@@ -626,9 +837,18 @@ class Queries
         return $n;
     }
 
-    private static function sqlShape($sql, $db)
+    private static function sqlShape($sql, $db, $backslashLiteral = null)
     {
         $mysql = $db === 'mysql' || $db === 'mariadb';
+        $postgres = $db === 'postgresql';
+        // Where a backslash in a string is just a character: PostgreSQL's
+        // plain strings (standard_conforming_strings, on since 9.1), SQLite,
+        // SQL Server and Oracle. Read as an escape there, 'C:\' ends late and
+        // lets what follows out (#376). MySQL, MariaDB, ClickHouse and
+        // unknown databases escape.
+        $literal = $backslashLiteral === null
+            ? ($postgres || $db === 'sqlite' || $db === 'mssql' || $db === 'oracle')
+            : $backslashLiteral;
         $out = '';
         $n = strlen($sql);
         $i = 0;
@@ -653,14 +873,17 @@ class Queries
             } elseif ($c === "'" || ($c === '"' && $mysql)) {
                 // A string's one-letter prefix: E'..' N'..' X'..' B'..'.
                 $len = strlen($out);
-                if ($len > 0 && strpos('EeNnXxBb', $out[$len - 1]) !== false
-                    && ($len === 1 || !(ctype_alnum($out[$len - 2]) && ord($out[$len - 2]) < 128 || $out[$len - 2] === '_'))) {
+                $prefixed = $len > 0 && strpos('EeNnXxBb', $out[$len - 1]) !== false
+                    && ($len === 1 || !(ctype_alnum($out[$len - 2]) && ord($out[$len - 2]) < 128 || $out[$len - 2] === '_'));
+                // Only PostgreSQL's E'..' escapes with a backslash where it is literal.
+                $escapes = !$literal || ($postgres && $prefixed && ($out[$len - 1] === 'E' || $out[$len - 1] === 'e'));
+                if ($prefixed) {
                     $out = substr($out, 0, -1);
                 }
-                $i = self::quoteEnd($sql, $i, $c);
+                $i = self::quoteEnd($sql, $i, $c, $escapes);
                 $out .= '?';
             } elseif ($c === '"' || $c === '`') {
-                $end = self::quoteEnd($sql, $i, $c);
+                $end = self::quoteEnd($sql, $i, $c, !$literal);
                 $out .= substr($sql, $i, $end - $i);
                 $i = $end;
             } elseif ($c === '$' && !self::isWord($prev) && preg_match('/^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/', substr($sql, $i, 64), $m)) {

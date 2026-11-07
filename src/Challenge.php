@@ -10,7 +10,7 @@
 // needs nothing stored on the server. The shared cases every client runs are
 // sdk/protocols/challenge-cases.json (test/ChallengeTest.php).
 //
-// Used by Firewall::check() as step 7, after the rate limit.
+// Used by Firewall::check() as step 8, after the rate limit.
 
 namespace AnalyticsPlatform;
 

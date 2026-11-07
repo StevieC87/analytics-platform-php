@@ -5,7 +5,9 @@
 // every request. Errors Laravel reports go to the Errors report too, and
 // with 'capture_logs' the exceptions your code logs. Rate
 // limits count in the app's cache store, so APCu isn't needed. Every database
-// query is timed for Server speed (QueryExecuted, what DB::listen hears).
+// query is timed for Server speed (QueryExecuted, what DB::listen hears), and
+// every call of its Http client (its RequestSending and ResponseReceived
+// events), and the queues are read from queue:work (QueueWatch).
 //
 // In your code: app(AnalyticsPlatform\Platform::class)->track('purchase', [...]).
 
@@ -46,6 +48,8 @@ class FirewallServiceProvider extends ServiceProvider
                 'analytics' => (bool) $config['analytics'],
                 'performance' => (bool) ($config['performance'] ?? true),
                 'queries' => (bool) ($config['queries'] ?? true),
+                'calls' => (bool) ($config['calls'] ?? true),
+                'queues' => (bool) ($config['queues'] ?? true),
                 // composer.lock is in the app's root.
                 'inventory' => ($config['inventory'] ?? true) ? array('root' => base_path()) : false,
                 // Only the folder the web server serves is walked.
@@ -65,6 +69,8 @@ class FirewallServiceProvider extends ServiceProvider
         $this->breadcrumbs();
         // And its queries are its own.
         $this->queries();
+        // Jobs added count in every process; the worker reads its queues.
+        $this->queueBacklog();
         if ($this->app->runningInConsole()) {
             $this->queueJobs();
             return;
@@ -122,16 +128,78 @@ class FirewallServiceProvider extends ServiceProvider
     }
 
     // What Laravel's HTTP client asked other services for: steps in the trail
-    // shown before an error. Its events are public, so nothing is patched.
+    // shown before an error, and each call's time for Server speed → Calls,
+    // from RequestSending to ResponseReceived (or ConnectionFailed). Its
+    // events are public, so nothing is patched. ResponseReceived comes once
+    // the body is in too, so a call's time includes reading it.
     private function breadcrumbs()
     {
         $events = $this->app['events'];
         if (class_exists('Illuminate\\Http\\Client\\Events\\ResponseReceived')) {
-            $events->listen('Illuminate\\Http\\Client\\Events\\ResponseReceived', function ($e) {
-                $this->app->make(Platform::class)->addRequestBreadcrumb($e->request->method(), $e->request->url(), $e->response->status());
+            $timed = (bool) $this->app['config']->get('analytics-firewall.performance', true)
+                && (bool) $this->app['config']->get('analytics-firewall.calls', true);
+            // The calls sent and not answered yet: their request, method,
+            // address and start. ResponseReceived hands back the same request;
+            // ConnectionFailed may make a new one, found by method and address.
+            $pending = array();
+            if ($timed && class_exists('Illuminate\\Http\\Client\\Events\\RequestSending')) {
+                $events->listen('Illuminate\\Http\\Client\\Events\\RequestSending', function ($e) use (&$pending) {
+                    try {
+                        if (count($pending) >= 100) {
+                            array_shift($pending);
+                        }
+                        $pending[] = array($e->request, (string) $e->request->method(), (string) $e->request->url(), microtime(true));
+                    } catch (\Throwable $error) {
+                        // untimed
+                    }
+                });
+            }
+            $answered = function ($request, $status) use (&$pending) {
+                try {
+                    $method = (string) $request->method();
+                    $url = (string) $request->url();
+                    // Its own request, else the oldest one sent to that address.
+                    $found = null;
+                    foreach ($pending as $i => $item) {
+                        if ($item[0] === $request) {
+                            $found = $i;
+                            break;
+                        }
+                    }
+                    if ($found === null) {
+                        foreach ($pending as $i => $item) {
+                            if ($item[1] === $method && $item[2] === $url) {
+                                $found = $i;
+                                break;
+                            }
+                        }
+                    }
+                    if ($found === null) {
+                        return;
+                    }
+                    $started = $pending[$found][3];
+                    array_splice($pending, $found, 1);
+                    $this->app->make(Platform::class)->recordCall($method, $url, (microtime(true) - $started) * 1000, $status);
+                } catch (\Throwable $error) {
+                    // untimed
+                }
+            };
+            // A listener that throws would reach the code that made the call.
+            $events->listen('Illuminate\\Http\\Client\\Events\\ResponseReceived', function ($e) use ($answered) {
+                try {
+                    $this->app->make(Platform::class)->addRequestBreadcrumb($e->request->method(), $e->request->url(), $e->response->status());
+                    $answered($e->request, (int) $e->response->status());
+                } catch (\Throwable $error) {
+                    // untimed
+                }
             });
-            $events->listen('Illuminate\\Http\\Client\\Events\\ConnectionFailed', function ($e) {
-                $this->app->make(Platform::class)->addRequestBreadcrumb($e->request->method(), $e->request->url(), 0);
+            $events->listen('Illuminate\\Http\\Client\\Events\\ConnectionFailed', function ($e) use ($answered) {
+                try {
+                    $this->app->make(Platform::class)->addRequestBreadcrumb($e->request->method(), $e->request->url(), 0);
+                    $answered($e->request, 0);
+                } catch (\Throwable $error) {
+                    // untimed
+                }
             });
         }
         // Octane serves many requests from one process.
@@ -184,6 +252,38 @@ class FirewallServiceProvider extends ServiceProvider
         // Octane serves many requests from one process: each starts afresh.
         $events->listen('Laravel\\Octane\\Events\\RequestReceived', function () {
             $this->app->make(Platform::class)->beginRequest();
+        });
+    }
+
+    // Job queues (sdk/protocols/queues.md), with Server speed: every
+    // process counts the jobs it adds, and a queue:work worker counts those
+    // it finishes and reads its queues between jobs, once a minute. Which
+    // queues: the worker's own, and watch_queues ("redis:emails,default").
+    private function queueBacklog()
+    {
+        $config = $this->app['config'];
+        if (!$config->get('analytics-firewall.performance', true) || !$config->get('analytics-firewall.queues', true)
+            || !class_exists('Illuminate\\Queue\\Events\\JobQueued')) {
+            return;
+        }
+        $watch = new QueueWatch($this->app, $config->get('analytics-firewall.watch_queues', ''));
+        $events = $this->app['events'];
+        $events->listen('Illuminate\\Queue\\Events\\JobQueued', function ($e) use ($watch) {
+            $watch->queued($e);
+        });
+        if (!$this->app->runningInConsole()) {
+            return;
+        }
+        $events->listen('Illuminate\\Queue\\Events\\JobProcessed', function ($e) use ($watch) {
+            $watch->finished($e, false);
+        });
+        $events->listen('Illuminate\\Queue\\Events\\JobFailed', function ($e) use ($watch) {
+            $watch->finished($e, true);
+        });
+        // Looping's listeners can stop the worker by returning false: this
+        // one returns nothing.
+        $events->listen('Illuminate\\Queue\\Events\\Looping', function ($e) use ($watch) {
+            $watch->looping($e);
         });
     }
 

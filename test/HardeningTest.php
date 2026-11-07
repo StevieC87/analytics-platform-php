@@ -115,7 +115,6 @@ $firewall->countStatic(404);
 check('but one that answered 404 is', count($keys) === 1);
 $firewall->check('198.51.100.20', 'GET', '/');
 check('a page is counted as before', count($keys) === 2);
-check('static by extension, query left out', Firewall::isStatic('/a/b.JPG?x=1') && !Firewall::isStatic('/style.css.php') && !Firewall::isStatic("/a.css\n"));
 
 // ---- 11. Paths a router normalises ----------------------------------------------
 

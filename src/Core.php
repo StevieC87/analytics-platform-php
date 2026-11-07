@@ -12,7 +12,7 @@ namespace AnalyticsPlatform;
 
 class Core
 {
-    const VERSION = '0.3.4';
+    const VERSION = '0.3.5';
     const TIMEOUT = 4;
     const MIN_SYNC = 30;
     const RETRY = 60;
@@ -326,13 +326,65 @@ class Core
         if ($line === false) {
             return false;
         }
-        $line .= "\n";
-        clearstatcache(true, $file);
-        // The line counts too: the file never grows past $max.
-        if ((is_file($file) ? filesize($file) : 0) + strlen($line) > $max) {
-            return false;
+        return $this->appendText($file, $line . "\n", $max);
+    }
+
+    // Appends whole lines under the file's lock, measuring it under the lock
+    // too, so many FPM workers at once neither interleave nor push it past
+    // $max (the line counts: the file never grows past it). A file take()
+    // moved away while this waited for the lock is let go and the line goes
+    // into the new one, so nothing is written after take() has read it; a
+    // writer can lose that race more than once while sends follow each other
+    // closely, hence the few tries. Opened 'a+' so the last byte can be
+    // read: a writer killed mid-line left the file without its newline, and
+    // this line then starts on one of its own rather than being glued to the
+    // half one (empty lines are skipped). Writes still all go to the end.
+    // Without file locks (some network filesystems) nothing is written:
+    // drain() needs them too, so a spool written there would never be sent.
+    private function appendText($file, $text, $max = null)
+    {
+        for ($try = 0; $try < 50; $try++) {
+            $handle = @fopen($file, 'a+b');
+            if (!$handle) {
+                return false;
+            }
+            if (!@flock($handle, LOCK_EX)) {
+                fclose($handle);
+                return false;
+            }
+            $here = @fstat($handle);
+            clearstatcache(true, $file);
+            if (!self::sameFile($here, @stat($file))) {
+                flock($handle, LOCK_UN);
+                fclose($handle);
+                continue;
+            }
+            $size = $here['size'];
+            $out = $size > 0 && (@fseek($handle, -1, SEEK_END) !== 0 || @fread($handle, 1) !== "\n") ? "\n" . $text : $text;
+            $ok = $max === null || $size + strlen($out) <= $max;
+            if ($ok) {
+                $ok = @fwrite($handle, $out) === strlen($out);
+                @fflush($handle);
+                // A disk that filled mid-line: the half line would spoil the next.
+                // ftruncate() works on an append handle; only writes are pinned to the end.
+                if (!$ok) {
+                    @ftruncate($handle, $size);
+                }
+            }
+            flock($handle, LOCK_UN);
+            fclose($handle);
+            return $ok;
         }
-        return @file_put_contents($file, $line, FILE_APPEND | LOCK_EX) !== false;
+        return false;
+    }
+
+    // Whether an open handle's fstat() and the path's stat() are one file.
+    // On Windows they fill st_dev differently (the volume's serial number,
+    // the drive letter), so only the file index is compared there.
+    private static function sameFile($a, $b)
+    {
+        return is_array($a) && is_array($b) && $a['ino'] === $b['ino']
+            && (DIRECTORY_SEPARATOR === '\\' || $a['dev'] === $b['dev']);
     }
 
     // Whether anything is waiting to be sent, new or to be resent.
@@ -342,6 +394,15 @@ class Core
         $base = $this->dir . '/' . $name;
         return is_file($base . '.jsonl') || is_file($base . '.retry.jsonl')
             || is_file($base . '.jsonl.sending') || is_file($base . '.retry.jsonl.sending');
+    }
+
+    // Whether <name>.jsonl holds more than $bytes: sent at once then,
+    // rather than at the next minute.
+    public function spoolOver($name, $bytes)
+    {
+        $file = $this->dir . '/' . $name . '.jsonl';
+        clearstatcache(true, $file);
+        return is_file($file) && filesize($file) > $bytes;
     }
 
     // Whether the last send was at least $every seconds ago.
@@ -430,7 +491,7 @@ class Core
             $res = $i < self::RESEND ? $this->http('POST', $batch['path'], $batch['body'], array(), $auth) : array('status' => 0);
             if (self::retryable($res['status'])) {
                 $rest = array_slice($lines, $i);
-                @file_put_contents($file, implode("\n", $rest) . "\n", FILE_APPEND | LOCK_EX);
+                $this->appendText($file, implode("\n", $rest) . "\n");
                 break;
             }
         }
@@ -457,7 +518,28 @@ class Core
                 return array(array(), '');
             }
         }
-        $lines = file($sending, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: array();
+        // A worker still writing to it (it opened the file before the move)
+        // holds its lock: waited for, and the file read while holding it, so
+        // no half line is read (and on Windows, where a lock also bars
+        // reading, a late writer's lock can't fail the read). One that gets
+        // the lock after this sees the file was moved and writes to the new
+        // one (appendText()).
+        $text = '';
+        $handle = @fopen($sending, 'rb');
+        if ($handle) {
+            $locked = @flock($handle, LOCK_EX);
+            $text = (string) @stream_get_contents($handle);
+            if ($locked) {
+                flock($handle, LOCK_UN);
+            }
+            fclose($handle);
+        }
+        $lines = array();
+        foreach (explode("\n", $text) as $line) {
+            if ($line !== '') {
+                $lines[] = $line;
+            }
+        }
         return array($lines, $sending);
     }
 

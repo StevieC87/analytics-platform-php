@@ -207,6 +207,154 @@ if (is_readable('/proc/meminfo')) {
     check('a real sample reports the application\'s own memory', isset($afterGap['proc_rss_mb']) && $afterGap['proc_rss_mb'] >= 1);
 }
 
+
+// ---- Limits: how close it is to a wall (resources.md, "Limits") -----------------------
+
+// A stand-in filesystem: path -> contents, '' for anything else.
+function filesystem(array $files)
+{
+    return function ($path) use ($files) {
+        return isset($files[$path]) ? $files[$path] : '';
+    };
+}
+
+$NETSTAT = "TcpExt: SyncookiesSent ListenOverflows ListenDrops\nTcpExt: 0 %d 7\nIpExt: InNoRoutes\nIpExt: 0\n";
+$v2 = array(
+    '/proc/self/cgroup' => "0::/\n",
+    '/sys/fs/cgroup/memory.max' => "536870912\n",
+    '/sys/fs/cgroup/memory.current' => "524288000\n",
+    '/sys/fs/cgroup/memory.stat' => "anon 300000000\ninactive_file 104857600\nactive_file 1\n",
+    '/sys/fs/cgroup/memory.events' => "low 0\nhigh 0\nmax 4\noom 1\noom_kill 2\n",
+    '/sys/fs/cgroup/cpu.max' => "150000 100000\n",
+    '/sys/fs/cgroup/cpu.stat' => "usage_usec 1\nnr_periods 1000\nnr_throttled 50\nthrottled_usec 9\n",
+    '/proc/pressure/cpu' => "some avg10=1.00 avg60=12.34 avg300=3.00 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+    '/proc/pressure/memory' => "some avg10=0.00 avg60=0.50 avg300=0.00 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+    '/proc/net/netstat' => sprintf($NETSTAT, 40),
+    '/proc/sys/net/netfilter/nf_conntrack_count' => "3000\n",
+    '/proc/sys/net/netfilter/nf_conntrack_max' => "262144\n",
+);
+check('the v2 path and the v1 controllers are found in /proc/self/cgroup',
+    Resources::cgroupPaths("0::/system.slice/php-fpm.service\n") === array('v2' => '/system.slice/php-fpm.service', 'memory' => null, 'cpu' => null)
+    && Resources::cgroupPaths("5:memory:/docker/abc\n4:cpu,cpuacct:/docker/abc\n") === array('v2' => null, 'memory' => '/docker/abc', 'cpu' => '/docker/abc'));
+list($first, $keep) = Resources::limits(array(), true, 7953, 4, filesystem($v2), null);
+check('a container\'s memory cap and working set (current less inactive_file)', $first['limit_mem_mb'] === 512 && $first['limit_mem_used_mb'] === 400);
+check('its CPU cap in cores', $first['limit_cpu_cores'] === 1.5);
+check('one reading of the counts says nothing yet', !isset($first['oom_kills']) && !isset($first['cpu_throttled_pct']) && !isset($first['listen_drops']));
+check('waiting time is avg60 of the "some" line, and io left out when the kernel has none', $first['psi_cpu_pct'] === 12.3 && $first['psi_mem_pct'] === 0.5
+    && !isset($first['psi_io_pct']));
+check('how full the connection table is', $first['conntrack_pct'] === 1.1);
+check('no FPM, no pool and no process key', !isset($first['workers_busy']) && !isset($first['proc_key']) && !isset($first['proc_uptime_s']));
+check('no open files and no requests in progress from PHP', !isset($first['fds_used']) && !isset($first['inflight_peak']));
+
+$v2['/sys/fs/cgroup/memory.events'] = "oom_kill 5\n";
+$v2['/sys/fs/cgroup/cpu.stat'] = "nr_periods 1600\nnr_throttled 200\n";
+$v2['/proc/net/netstat'] = sprintf($NETSTAT, 43);
+list($second, $keep2) = Resources::limits(json_decode(json_encode($keep), true), true, 7953, 4, filesystem($v2), null);
+check('kills, throttling and refused connections are the difference since the last sample', $second['oom_kills'] === 3
+    && $second['cpu_throttled_pct'] === 25.0 && $second['listen_drops'] === 3);
+list($gap) = Resources::limits(json_decode(json_encode($keep), true), false, 7953, 4, filesystem($v2), null);
+check('after a long gap the counts keep their whole difference; the throttled share is dropped', $gap['oom_kills'] === 3
+    && $gap['listen_drops'] === 3 && !isset($gap['cpu_throttled_pct']));
+$v2['/sys/fs/cgroup/memory.events'] = "oom_kill 0\n";
+list($reset) = Resources::limits(json_decode(json_encode($keep2), true), true, 7953, 4, filesystem($v2), null);
+check('a counter that went down was reset: nothing sent', !isset($reset['oom_kills']));
+
+$none = $v2;
+$none['/sys/fs/cgroup/memory.max'] = "max\n";
+$none['/sys/fs/cgroup/cpu.max'] = "max 100000\n";
+list($bare) = Resources::limits(array(), true, 7953, 4, filesystem($none), null);
+check('"max" is no cap: neither half is sent', !isset($bare['limit_mem_mb']) && !isset($bare['limit_mem_used_mb']) && !isset($bare['limit_cpu_cores']));
+$big = $v2;
+$big['/sys/fs/cgroup/memory.max'] = "17179869184\n";
+$big['/sys/fs/cgroup/cpu.max'] = "800000 100000\n";
+list($above) = Resources::limits(array(), true, 7953, 4, filesystem($big), null);
+check('a cap at or above the machine\'s own is no cap', !isset($above['limit_mem_mb']) && !isset($above['limit_cpu_cores']));
+
+$v1 = array(
+    '/proc/self/cgroup' => "12:memory:/docker/abc\n4:cpu,cpuacct:/docker/abc\n0::/\n",
+    '/sys/fs/cgroup/memory/memory.limit_in_bytes' => "9223372036854771712\n",
+    '/sys/fs/cgroup/memory/memory.usage_in_bytes' => "104857600\n",
+    '/sys/fs/cgroup/memory/memory.stat' => "total_inactive_file 0\n",
+    '/sys/fs/cgroup/memory/memory.oom_control' => "oom_kill_disable 0\nunder_oom 0\noom_kill 1\n",
+    '/sys/fs/cgroup/cpu/cpu.cfs_quota_us' => "200000\n",
+    '/sys/fs/cgroup/cpu/cpu.cfs_period_us' => "100000\n",
+);
+list($old) = Resources::limits(array(), true, 7953, 4, filesystem($v1), null);
+check('cgroup v1, in a container\'s own namespace: v1\'s "no limit" number is no cap, the CPU quota is', !isset($old['limit_mem_mb'])
+    && $old['limit_cpu_cores'] === 2.0);
+list($nothing) = Resources::limits(array(), true, 7953, 4, filesystem(array()), null);
+check('outside Linux nothing at all is sent', $nothing === array());
+
+// PHP-FPM's pool.
+$fpm = array('pool' => 'www', 'process-manager' => 'static', 'start-time' => 1760000000, 'listen-queue' => 3,
+    'active-processes' => 7, 'total-processes' => 8, 'max-children-reached' => 2);
+$kept = array();
+$pool = Resources::fpmFields($fpm, array(), $kept, 1760000600);
+check('FPM: workers busy, its maximum under pm = static, connections waiting', $pool['workers_busy'] === 7 && $pool['workers_max'] === 8
+    && $pool['queue_waiting'] === 3);
+check('the pool names the row and says how long it has run', preg_match('/^[a-f0-9]{16}$/', $pool['proc_key']) && $pool['proc_uptime_s'] === 600);
+check('one reading of max-children-reached says nothing yet', !isset($pool['pool_maxed']));
+$fpm['max-children-reached'] = 5;
+$fpm['process-manager'] = 'dynamic';
+$kept2 = array();
+$again = Resources::fpmFields($fpm, json_decode(json_encode($kept), true), $kept2, 1760000660);
+check('the pool at its cap since the last sample, and no maximum under pm = dynamic', $again['pool_maxed'] === 3 && !isset($again['workers_max'])
+    && $again['proc_key'] === $pool['proc_key']);
+$fpm['start-time'] = 1760000700;
+$fpm['max-children-reached'] = 0;
+$kept3 = array();
+$restarted = Resources::fpmFields($fpm, json_decode(json_encode($kept2), true), $kept3, 1760000720);
+check('a restarted pool is a new process: a new key, uptime from 0, no difference', !isset($restarted['pool_maxed'])
+    && $restarted['proc_key'] !== $pool['proc_key'] && $restarted['proc_uptime_s'] === 20);
+check('not FPM: nothing', Resources::fpmFields(false, array(), $kept3) === array());
+
+// A sample outside FPM (a command-line cron run) keeps the pool's state.
+list(, $cliKeep) = Resources::limits(array('fpm' => $kept2['fpm']), true, 7953, 4, filesystem(array()), null);
+check('a sample outside FPM keeps the pool\'s key and count for the next one', isset($cliKeep['fpm']) && $cliKeep['fpm'] === $kept2['fpm']);
+
+// The state outlives a reboot; the kernel's counters don't.
+$booted = $v2;
+$booted['/proc/uptime'] = "1000.5 900.1\n";
+$booted['/proc/net/netstat'] = sprintf($NETSTAT, 40);
+list(, $bootKeep) = Resources::limits(array(), true, 7953, 4, filesystem($booted), null, 1760000000);
+$booted['/proc/net/netstat'] = sprintf($NETSTAT, 45);
+list($sameBoot) = Resources::limits(json_decode(json_encode($bootKeep), true), true, 7953, 4, filesystem($booted), null, 1760000060);
+$booted['/proc/uptime'] = "30.0 20.0\n";
+list($rebooted) = Resources::limits(json_decode(json_encode($bootKeep), true), true, 7953, 4, filesystem($booted), null, 1760000060);
+check('after a reboot the counts start again rather than diffing against the last boot', isset($sameBoot['listen_drops'])
+    && $sameBoot['listen_drops'] === 5 && !isset($rebooted['listen_drops']) && !isset($rebooted['oom_kills']));
+
+// One state folder, two containers' cgroups sampling into it in turn (the web
+// and the worker containers sharing a storage volume): each is diffed against
+// its own last reading, never the other's.
+$cgroupAt = function ($path, $oom) {
+    return array('/proc/self/cgroup' => "0::$path\n", "/sys/fs/cgroup$path/memory.current" => "1000\n",
+        "/sys/fs/cgroup$path/memory.events" => "oom_kill $oom\n");
+};
+list(, $shared) = Resources::limits(array(), true, 7953, 4, filesystem($cgroupAt('/web', 0)), null, 1760000000);
+list($worker, $shared) = Resources::limits(json_decode(json_encode($shared), true), true, 7953, 4, filesystem($cgroupAt('/worker', 6)), null, 1760000060);
+list($web, $shared) = Resources::limits(json_decode(json_encode($shared), true), true, 7953, 4, filesystem($cgroupAt('/web', 1)), null, 1760000120);
+list($worker2) = Resources::limits(json_decode(json_encode($shared), true), true, 7953, 4, filesystem($cgroupAt('/worker', 6)), null, 1760000180);
+check('two cgroups in one state: no kills made up from their difference, each one\'s own counted', !isset($worker['oom_kills'])
+    && $web['oom_kills'] === 1 && $worker2['oom_kills'] === 0);
+
+// Two pools in turn: each keeps its own key and count.
+$poolA = array('pool' => 'www', 'start-time' => 1760000000, 'max-children-reached' => 1);
+$poolB = array('pool' => 'admin', 'start-time' => 1760000000, 'max-children-reached' => 9);
+$k1 = array();
+$a1 = Resources::fpmFields($poolA, array(), $k1, 1760000600);
+$k2 = array();
+$b1 = Resources::fpmFields($poolB, json_decode(json_encode($k1), true), $k2, 1760000660);
+$k3 = array();
+$poolA['max-children-reached'] = 4;
+$a2 = Resources::fpmFields($poolA, json_decode(json_encode($k2), true), $k3, 1760000720);
+check('two pools in turn: each keeps its key, and its count is its own', !isset($b1['pool_maxed']) && $a2['proc_key'] === $a1['proc_key']
+    && $a2['pool_maxed'] === 3 && $b1['proc_key'] !== $a1['proc_key']);
+
+// A real sample keeps the counters for the next one.
+$state = json_decode(file_get_contents($core->dir() . '/resources.state'), true);
+check('the state keeps the limits\' counters beside the CPU ones', array_key_exists('lim', $state));
+
 // Tidy up.
 foreach (glob($core->dir() . '/*') ?: array() as $file) {
     @unlink($file);

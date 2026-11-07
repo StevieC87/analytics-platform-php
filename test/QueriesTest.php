@@ -186,6 +186,9 @@ namespace {
     check('an array of different shapes keeps each', Queries::normalize('find t [1,"a",{}]', 'mongodb') === 'find t ["?","?",{}]');
     check('bytes that are not UTF-8 are copied, not a failure', Queries::normalize("SELECT 'a' AS \xFF", 'mysql') === "SELECT ? AS \xFF");
     check('not a string is nothing', Queries::normalize(null, 'mysql') === '');
+    // As JavaScript's toLowerCase: the Kelvin sign is a k, and nothing else non-ASCII is a letter of a name.
+    check('a database name is lower-cased as the reference does', Queries::databaseOf("CLIC\xE2\x84\xAAHOUSE") === 'clickhouse'
+        && Queries::databaseOf('SQLite') === 'sqlite' && Queries::databaseOf("SQL\xC4\xB0TE") === 'other');
     check('a driver name maps to the database', Queries::databaseOfDriver('pdo_pgsql') === 'postgresql' && Queries::databaseOfDriver('sqlsrv') === 'mssql'
         && Queries::databaseOfDriver('firebird') === 'other');
     check('a Mongo command is written as the protocol says', Queries::mongoText('find', (object) array('find' => 'users', 'filter' => (object) array('email' => 'a@b.c'))) === 'find users {"email":"a@b.c"}');
@@ -207,14 +210,30 @@ namespace {
             'firewall' => false, 'proxy' => false, 'inventory' => false, 'resources' => false, 'crawlers' => false));
     }
 
-    // The lines waiting in queries.jsonl.
+    // The lines waiting with queries or calls in them: requests' and jobs'
+    // in requests.jsonl (beside their timing), then the background ones in
+    // queries.jsonl.
     function spooled(Platform $platform)
     {
-        $file = $platform->core()->dir() . '/queries.jsonl';
-        $lines = is_file($file) ? file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) : array();
-        return array_map(function ($line) {
-            return json_decode($line, true);
-        }, $lines);
+        $lines = array();
+        foreach (array('requests', 'queries') as $name) {
+            $file = $platform->core()->dir() . '/' . $name . '.jsonl';
+            foreach (is_file($file) ? file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) : array() as $line) {
+                $line = json_decode($line, true);
+                if (isset($line['q']) || isset($line['c'])) {
+                    $lines[] = $line;
+                }
+            }
+        }
+        return $lines;
+    }
+
+    // The minute passing: both spools added up and sent.
+    function flushAll(Platform $platform)
+    {
+        $platform->module('performance')->flush(true);
+        $timings = $platform->module('queries') ?: $platform->module('calls');
+        $timings->flush(true);
     }
 
     // What flush() would have sent: the bodies kept to send again.
@@ -233,6 +252,7 @@ namespace {
     {
         $platform->core()->ensureDir();
         touch($platform->core()->dir() . '/queries.lock');
+        touch($platform->core()->dir() . '/requests.lock');
         return $platform;
     }
 
@@ -323,7 +343,7 @@ namespace {
 
     // A job's lines are written as it ends; flush(true) is the minute passing.
     check('the job has its own line', count(spooled($platform)) === 4);
-    $platform->module('queries')->flush(true);
+    flushAll($platform);
 
     // ---- The payload --------------------------------------------------------------------
 
@@ -357,7 +377,7 @@ namespace {
         }
         $caps->recordAndSend();
     }
-    $caps->module('queries')->flush(true);
+    flushAll($caps);
     $rows = array();
     foreach (sent($caps) as $batch) {
         $rows = array_merge($rows, $batch['body']['rows']);
@@ -369,6 +389,9 @@ namespace {
 
     // ---- TimedPdo, against a real SQLite database -------------------------------------
 
+    if (!in_array('sqlite', PDO::getAvailableDrivers(), true)) {
+        echo "SKIP: PDO has no SQLite driver here, so TimedPdo isn't run against a database\n";
+    } else {
     $platform = hold(platformAt(storeOf('pdo')));
     $platform->beginRequest();
     $platform->setRoute('/pdo');
@@ -396,6 +419,7 @@ namespace {
         && $byStatement['INSERT INTO users (email) VALUES (?)'][2] === 2 && $byStatement['INSERT INTO users (email) VALUES (?)'][0] === 'sqlite'
         && isset($byStatement['SELECT count(*) FROM users WHERE email LIKE ?']));
     check('a query that threw counts as failed', $byStatement['SELECT * FROM missing'][3] === 1);
+    }
 
     // ---- Laravel ----------------------------------------------------------------------
 
@@ -605,6 +629,7 @@ namespace {
         && isset($byStatement['UPDATE product SET views = views + ?']));
     check('a Doctrine query that threw counts as failed', $byStatement['SELECT * FROM missing'][3] === 1);
     // A TimedPdo under Doctrine leaves the query to the middleware.
+    if (in_array('sqlite', PDO::getAvailableDrivers(), true)) {
     $symfony->beginRequest();
     $inner = new TimedPdo('sqlite::memory:');
     Queries::timed('mysql', 'SELECT 1', function () use ($inner) {
@@ -613,6 +638,7 @@ namespace {
     $symfony->recordAndSend();
     $lines = spooled($symfony);
     check('two layers count one query once', count($lines[1]['q']) === 1 && $lines[1]['q'][0][0] === 'mysql');
+    }
 
     // ---- WordPress: the db.php drop-in ------------------------------------------------
 

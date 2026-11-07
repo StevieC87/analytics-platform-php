@@ -179,12 +179,9 @@ class PlatformSubscriber implements EventSubscriberInterface, CacheWarmerInterfa
                 return;
             }
             if ($decision['action'] === 'block') {
-                $headers = array('Content-Type' => 'text/plain; charset=utf-8', 'Cache-Control' => 'no-store');
-                $rules = $firewall->status();
-                if ($decision['status'] === 429 && !empty($rules['rate'])) {
-                    $headers['Retry-After'] = (string) $rules['rate']['window'];
-                }
-                $event->setResponse(new Response($decision['status'] === 429 ? 'Too Many Requests' : 'Forbidden', $decision['status'], $headers));
+                // A page limit's Retry-After is its own window, not the rate's.
+                $answer = $firewall->blockedResponse($decision);
+                $event->setResponse(new Response($answer['body'], $answer['status'], $answer['headers']));
                 return;
             }
         }
@@ -294,11 +291,33 @@ class PlatformSubscriber implements EventSubscriberInterface, CacheWarmerInterfa
             if (!headers_sent() || (int) http_response_code() !== $status) {
                 @http_response_code($status);
             }
+            // A static-looking request the router sent to a controller
+            // ("/search/{q}" took "/search/x.css") counts toward the rate
+            // and the page limits after all (firewall.md, `rate`).
+            $firewall = $this->platform->firewall();
+            if ($firewall) {
+                $firewall->markRouted(self::routedToPage($request->attributes->get('_route'), $route),
+                    $event->getResponse()->headers->get('Content-Type'));
+                // Counted now, by the response's own status: a worker
+                // (RoadRunner, FrankenPHP) has no shutdown after each request.
+                $firewall->countStatic($status);
+            }
             $this->platform->recordAndSend();
         } finally {
             $_SERVER = $server;
         }
         $this->reset();
+    }
+
+    // Whether the route the router matched ($name, its path $pattern, '' when
+    // not known) is a page of the app's: not one whose path is a file's
+    // ("/avatars/{id}.png"), nor LiipImagine's, which serve images.
+    public static function routedToPage($name, $pattern)
+    {
+        if (!is_string($name) || $name === '' || strpos($name, 'liip_imagine') === 0) {
+            return false;
+        }
+        return $pattern === '' || !\AnalyticsPlatform\Firewall::isStatic('/' . ltrim((string) $pattern, '/'));
     }
 
     // $_SERVER as PHP-FPM would have it for this request.

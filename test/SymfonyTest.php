@@ -433,6 +433,12 @@ namespace {
     unset($rules['challenge']);
     $platform->core()->writePhp('rules.php', $rules);
 
+    // ---- A static-looking request the router sent to a controller ----
+    check('a routed static-looking request counts late', PlatformSubscriber::routedToPage('search', '/search/{q}')
+        && PlatformSubscriber::routedToPage('search', ''));
+    check('no route, a file\'s route or LiipImagine\'s does not', !PlatformSubscriber::routedToPage(null, '')
+        && !PlatformSubscriber::routedToPage('avatar', '/avatars/{id}.png') && !PlatformSubscriber::routedToPage('liip_imagine_filter', '/media/cache/resolve/{filter}/{path}'));
+
     // ---- Errors and timing, after the response ----
     $request = new FakeRequest('GET', '/users/42', 'user_show');
     $subscriber->onException(new FakeEvent($request, null, new \RuntimeException('database down')));
