@@ -29,6 +29,10 @@
 //   whenever the extension is loaded (Laravel's mongodb connections are
 //   left to it, so they aren't counted twice).
 // - WordPress: the plugin's wp-content/db.php drop-in, else SAVEQUERIES.
+// - Redis: Laravel's CommandExecuted (the service provider turns its events
+//   on), and new TimedRedis(\Redis) / new TimedPredis(Predis\Client) in
+//   plain PHP. Each command is "GET user:?:cart" (redisCommand()): the
+//   command and its first key's shape, never an argument or value.
 // Each reports through Queries::report(), which works before any Platform
 // exists (WordPress's drop-in runs before the plugins load): those queries
 // wait here for the first one.
@@ -66,7 +70,7 @@ class Queries
     const MAX_STATEMENT = 1000;
     const OTHER = '(other)';
     const BACKGROUND = '(background)';
-    const DATABASES = array('postgresql', 'mysql', 'mariadb', 'sqlite', 'mssql', 'oracle', 'clickhouse', 'mongodb', 'other');
+    const DATABASES = array('postgresql', 'mysql', 'mariadb', 'sqlite', 'mssql', 'oracle', 'clickhouse', 'mongodb', 'redis', 'other');
     // Mongo's connection chatter, never a query of the site's.
     const MONGO_CHATTER = array('hello', 'isMaster', 'ismaster', 'ping', 'buildInfo', 'saslStart', 'saslContinue',
         'getMore', 'endSessions', 'killCursors', 'getLastError');
@@ -83,6 +87,8 @@ class Queries
     private static $depth = 0;
     private static $mongo = false;
     private static $cache = array();
+    // How deep inside untimed(): the package's own Redis commands.
+    private static $untimed = 0;
 
     private $core;
     private $options;
@@ -178,6 +184,25 @@ class Queries
                 self::report($db, $sql, (microtime(true) - $started) * 1000, $failed);
             }
         }
+    }
+
+    // Runs $fn with the Redis commands it makes left out: the package's own
+    // (QueueWatch's queue readings, the firewall's counter in Laravel's
+    // cache), which share the app's connection.
+    public static function untimed(callable $fn)
+    {
+        self::$untimed++;
+        try {
+            return $fn();
+        } finally {
+            self::$untimed = max(0, self::$untimed - 1);
+        }
+    }
+
+    // Whether a Redis command now is the package's own.
+    public static function isUntimed()
+    {
+        return self::$untimed > 0;
     }
 
     // Never throws: it runs inside the site's own query call (TimedPdo's
@@ -722,6 +747,7 @@ class Queries
             'oci' => 'oracle', 'oci8' => 'oracle', 'pdo_oci' => 'oracle', 'oracle' => 'oracle',
             'clickhouse' => 'clickhouse', 'pdo_clickhouse' => 'clickhouse',
             'mongodb' => 'mongodb',
+            'redis' => 'redis', 'phpredis' => 'redis', 'predis' => 'redis',
         );
         return isset($map[$name]) ? $map[$name] : 'other';
     }
@@ -738,6 +764,8 @@ class Queries
         $db = self::databaseOf($db);
         if ($db === 'mongodb') {
             $shaped = self::mongoStatement($text);
+        } elseif ($db === 'redis') {
+            $shaped = self::redisStatement($text);
         } elseif ($db === 'other' && strpos($text, '\\') !== false) {
             // A database we don't know may or may not take a backslash as an
             // escape, and each reading leaks what the other hides. When they
@@ -1020,6 +1048,174 @@ class Queries
             }
         }
         return '{' . implode(',', $parts) . '}';
+    }
+
+    // ---- Redis: the command and its first key's shape ------------------------------
+    // queryText.js's redisKeyShape(), redisCommand() and redisStatement(),
+    // ported; the shared cases' redis rows and redis_commands are run against
+    // these. ASCII only, as there: a key keeps each ":" segment that is only
+    // letters and "_" (32 at most), every other segment is "?".
+
+    const REDIS_WORD = '/^[A-Za-z][A-Za-z0-9_.|-]{0,39}\z/';
+    const REDIS_SEGMENT = '/^[A-Za-z_]{1,32}\z/';
+    // Commands whose second word is a subcommand (CLIENT SETNAME, XINFO STREAM).
+    const REDIS_CONTAINERS = array('ACL' => 1, 'CLIENT' => 1, 'CLUSTER' => 1, 'COMMAND' => 1, 'CONFIG' => 1, 'DEBUG' => 1,
+        'FUNCTION' => 1, 'LATENCY' => 1, 'MEMORY' => 1, 'MODULE' => 1, 'OBJECT' => 1, 'PUBSUB' => 1, 'SCRIPT' => 1,
+        'SLOWLOG' => 1, 'XGROUP' => 1, 'XINFO' => 1);
+    // Of those, the ones with a key after the subcommand.
+    const REDIS_SUB_KEY = array('OBJECT' => 1, 'MEMORY' => 1, 'XGROUP' => 1, 'XINFO' => 1);
+    // No key: what follows is a password, a message, a number or nothing.
+    const REDIS_NO_KEY = array('PING' => 1, 'ECHO' => 1, 'INFO' => 1, 'AUTH' => 1, 'HELLO' => 1, 'SELECT' => 1, 'QUIT' => 1,
+        'RESET' => 1, 'MULTI' => 1, 'EXEC' => 1, 'DISCARD' => 1, 'UNWATCH' => 1, 'DBSIZE' => 1, 'TIME' => 1, 'FLUSHDB' => 1,
+        'FLUSHALL' => 1, 'SAVE' => 1, 'BGSAVE' => 1, 'BGREWRITEAOF' => 1, 'LASTSAVE' => 1, 'SCAN' => 1, 'RANDOMKEY' => 1,
+        'SWAPDB' => 1, 'SHUTDOWN' => 1, 'ROLE' => 1, 'REPLICAOF' => 1, 'SLAVEOF' => 1, 'READONLY' => 1, 'READWRITE' => 1,
+        'LOLWUT' => 1, 'FAILOVER' => 1, 'PSYNC' => 1, 'SYNC' => 1, 'REPLCONF' => 1, 'MIGRATE' => 1);
+    // Script calls: script or name, then how many keys, then the keys.
+    const REDIS_SCRIPTS = array('EVAL' => 1, 'EVALSHA' => 1, 'EVAL_RO' => 1, 'EVALSHA_RO' => 1, 'FCALL' => 1, 'FCALL_RO' => 1);
+    // How many keys first, then the keys.
+    const REDIS_NUMKEYS = array('ZUNION' => 1, 'ZINTER' => 1, 'ZDIFF' => 1, 'SINTERCARD' => 1, 'ZINTERCARD' => 1, 'LMPOP' => 1, 'ZMPOP' => 1);
+    // Waiting, not working: a queue worker sits in these for seconds.
+    const REDIS_WAITING = array('BLPOP' => 1, 'BRPOP' => 1, 'BRPOPLPUSH' => 1, 'BLMOVE' => 1, 'BLMPOP' => 1, 'BZPOPMIN' => 1,
+        'BZPOPMAX' => 1, 'BZMPOP' => 1, 'WAIT' => 1, 'WAITAOF' => 1, 'SUBSCRIBE' => 1, 'PSUBSCRIBE' => 1, 'SSUBSCRIBE' => 1,
+        'UNSUBSCRIBE' => 1, 'PUNSUBSCRIBE' => 1, 'SUNSUBSCRIBE' => 1, 'MONITOR' => 1);
+    const REDIS_PREFIXES = array('PIPELINE' => 1, 'MULTI' => 1);
+
+    // ASCII only, whatever the locale (strtoupper follows it before PHP 8.2).
+    private static function asciiUpper($text)
+    {
+        return strtr($text, 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ');
+    }
+
+    public static function redisKeyShape($key)
+    {
+        // An empty key is "?" too: "GET " would read back as "GET".
+        if (!is_string($key) || $key === '') {
+            return '?';
+        }
+        $parts = explode(':', $key);
+        foreach ($parts as $i => $part) {
+            if ($part !== '' && !preg_match(self::REDIS_SEGMENT, $part)) {
+                $parts[$i] = '?';
+            }
+        }
+        return implode(':', $parts);
+    }
+
+    // JavaScript's Number($value) > 0, for the argument that says how many
+    // keys follow.
+    private static function positive($value)
+    {
+        if (is_int($value) || is_float($value)) {
+            return $value > 0;
+        }
+        if (is_bool($value)) {
+            return $value;
+        }
+        if (!is_string($value)) {
+            return false;
+        }
+        $value = self::trimJs($value);
+        if (preg_match('/^[+-]?Infinity\z/', $value)) {
+            return $value[0] !== '-';
+        }
+        if (preg_match('/^[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?\z/', $value)) {
+            return (float) $value > 0;
+        }
+        if (preg_match('/^0(?:[xX][0-9a-fA-F]+|[oO][0-7]+|[bB][01]+)\z/', $value)) {
+            return trim(substr($value, 2), '0') !== '';
+        }
+        return false;
+    }
+
+    // A command as the client sends it (array('GET', 'user:42')) ->
+    // "GET user:?", or null for one that isn't timed (blocking, or not a
+    // command).
+    public static function redisCommand($args)
+    {
+        if (!is_array($args) || !$args) {
+            return null;
+        }
+        $args = array_values($args);
+        if (!is_string($args[0]) || !preg_match(self::REDIS_WORD, $args[0])) {
+            return null;
+        }
+        $name = self::asciiUpper($args[0]);
+        if (isset(self::REDIS_WAITING[$name])) {
+            return null;
+        }
+        $n = count($args);
+        $key = null;
+        $command = $name;
+        if (isset(self::REDIS_CONTAINERS[$name])) {
+            if ($n > 1 && is_string($args[1]) && preg_match(self::REDIS_WORD, $args[1])) {
+                $command = $name . ' ' . self::asciiUpper($args[1]);
+                // Only after a subcommand: "OBJECT user" would read back as OBJECT USER.
+                if (isset(self::REDIS_SUB_KEY[$name])) {
+                    $key = 2;
+                }
+            }
+        } elseif ($name === 'XREAD' || $name === 'XREADGROUP') {
+            // Its options, then STREAMS and the keys. XREADGROUP's group and
+            // consumer come first and may be named anything, as may a stream.
+            for ($i = $name === 'XREADGROUP' ? 4 : 1; $i < $n; $i++) {
+                $word = is_string($args[$i]) ? self::asciiUpper($args[$i]) : '';
+                if ($word === 'BLOCK') {
+                    return null;
+                }
+                if ($word === 'STREAMS') {
+                    $key = $i + 1;
+                    break;
+                }
+            }
+        } elseif (isset(self::REDIS_SCRIPTS[$name])) {
+            if ($n > 2 && self::positive($args[2])) {
+                $key = 3;
+            }
+        } elseif (isset(self::REDIS_NUMKEYS[$name])) {
+            if ($n > 1 && self::positive($args[1])) {
+                $key = 2;
+            }
+        } elseif ($name === 'BITOP') {
+            $key = 2;
+        } elseif (!isset(self::REDIS_NO_KEY[$name]) && !isset(self::REDIS_PREFIXES[$name])) {
+            $key = 1;
+        }
+        return $key !== null && $key < $n ? $command . ' ' . self::redisKeyShape($args[$key]) : $command;
+    }
+
+    // A statement a package sent: [PIPELINE|MULTI] COMMAND [SUBCOMMAND] [key].
+    // Anything else (an argument a hook let through) is (other).
+    private static function redisStatement($text)
+    {
+        $text = self::trimJs($text);
+        if ($text === '') {
+            return '';
+        }
+        $words = preg_split('/' . self::WS . '+/', $text);
+        $n = count($words);
+        $out = array();
+        $i = 0;
+        if (isset(self::REDIS_PREFIXES[self::asciiUpper($words[0])]) && $n > 1) {
+            $out[] = self::asciiUpper($words[$i++]);
+        }
+        if (!preg_match(self::REDIS_WORD, $words[$i])) {
+            return self::OTHER;
+        }
+        $name = self::asciiUpper($words[$i++]);
+        if (isset(self::REDIS_WAITING[$name])) {
+            return self::OTHER;
+        }
+        $out[] = $name;
+        if (isset(self::REDIS_CONTAINERS[$name]) && $i < $n && preg_match(self::REDIS_WORD, $words[$i])) {
+            $out[] = self::asciiUpper($words[$i++]);
+        }
+        if ($i < $n - 1) {
+            return self::OTHER;
+        }
+        if ($i < $n) {
+            $out[] = self::redisKeyShape($words[$i]);
+        }
+        return implode(' ', $out);
     }
 
     // At most MAX_STATEMENT code points, trimmed again when cut.

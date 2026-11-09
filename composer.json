@@ -27,7 +27,9 @@
     "symfony/http-client": "For AnalyticsPlatform\\Symfony\\HttpClientBreadcrumbs (its requests before an error)",
     "doctrine/dbal": "For AnalyticsPlatform\\Symfony\\QueryMiddleware (3.2 or later: Doctrine's query timings)",
     "guzzlehttp/guzzle": "For Platform::guzzleMiddleware() (its calls' times, and steps before an error)",
-    "smi2/phpclickhouse": "For AnalyticsPlatform\\TimedClickHouse (ClickHouse query timings)"
+    "smi2/phpclickhouse": "For AnalyticsPlatform\\TimedClickHouse (ClickHouse query timings)",
+    "ext-redis": "For AnalyticsPlatform\\TimedRedis (phpredis command timings)",
+    "predis/predis": "For AnalyticsPlatform\\TimedPredis (Predis command timings)"
   },
   "autoload": {
     "psr-4": {

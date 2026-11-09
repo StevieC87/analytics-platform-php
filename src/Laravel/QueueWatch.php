@@ -22,6 +22,7 @@ namespace AnalyticsPlatform\Laravel;
 
 use AnalyticsPlatform\Core;
 use AnalyticsPlatform\Platform;
+use AnalyticsPlatform\Queries;
 
 class QueueWatch
 {
@@ -148,7 +149,15 @@ class QueueWatch
     }
 
     // The gauges of one queue now; none of them when it couldn't be read.
+    // The package's own Redis commands, so Server speed doesn't time them.
     public function read($connection, $queue)
+    {
+        return Queries::untimed(function () use ($connection, $queue) {
+            return $this->readNow($connection, $queue);
+        });
+    }
+
+    private function readNow($connection, $queue)
     {
         try {
             $q = $this->app['queue']->connection($connection);

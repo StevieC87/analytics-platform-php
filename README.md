@@ -53,7 +53,7 @@ own trusted proxies decide (`$request->ip()`, `getClientIp()`).
 | `headers` | Adds the security headers you pick on the Security page; your own headers win | on |
 | `forms` | Checks forms before you accept them: `$platform->checkForm()` (Laravel: the `ProtectForm` middleware) | on |
 | `performance` | Response times and errors per route (Health → Server speed); name a route with `$platform->setRoute('/orders/{id}')` | on |
-| `queries` | With `performance`: every database query's time per route (Health → Server speed → Queries), its values replaced by `?` before anything is counted. Laravel: automatic; Symfony: `QueryMiddleware`; plain PHP: `TimedPdo`, `TimedClickHouse`; MongoDB: automatic with the `mongodb` extension; WordPress: automatic (see "Database queries") | on |
+| `queries` | With `performance`: every database query's time per route (Health → Server speed → Queries), its values replaced by `?` before anything is counted. Laravel: automatic; Symfony: `QueryMiddleware`; plain PHP: `TimedPdo`, `TimedClickHouse`; MongoDB: automatic with the `mongodb` extension; Redis: automatic in Laravel, `TimedRedis`/`TimedPredis`; WordPress: automatic (see "Database queries") | on |
 | `calls` | With `performance`: how long each route waited on other services, by the host it called (Health → Server speed → Calls). Laravel's `Http` client: automatic; Symfony: `HttpClientBreadcrumbs`; Guzzle: `guzzleMiddleware()`; WordPress: automatic (see "Outgoing calls") | on |
 | `queues` | With `performance`: each job queue's backlog once a minute, and the jobs added and finished (Health → Server speed → Jobs). Laravel: automatic in `queue:work` (see "Job queues") | on |
 | `crawlers` | Which search engines and AI bots fetch your pages (Off-site → Crawlers). Your tracker can't see them: crawlers don't run JavaScript | on |
@@ -218,6 +218,19 @@ dashboard switch; `'queries' => false` keeps Server speed without it.
   none and the folder can be written, and removes it on deactivation. Otherwise it
   reads WordPress's `SAVEQUERIES` log at the end of the request, which misses the
   queries before plugins load and counts no failures.
+- **Redis:** each command as its command and first key's shape only
+  (`GET user:?:cart`), never an argument or value; blocking ones (`BLPOP`, `XREAD`
+  with a block) aren't timed, nor are the package's own queue readings.
+  Laravel: automatic (its `CommandExecuted`, with Redis events turned on for you);
+  a failure is seen from Laravel 12 (`CommandFailed`, no time), and not at all for
+  an error reply on phpredis, which answers `false`. Predis' `pipeline()` and
+  `transaction()` are one `PIPELINE`/`MULTI` call there; phpredis' bypass Laravel's
+  events, so their commands aren't seen. Plain PHP: `new
+  AnalyticsPlatform\TimedRedis(new \Redis())` (phpredis, `\RedisCluster` too) or
+  `new AnalyticsPlatform\TimedPredis(new Predis\Client(...))`; `multi()`/`pipeline()`
+  to `exec()`/`execute()` is one `MULTI SET cart:?` call. Code that type-hints the
+  client can't take the stand-in. WordPress: none (an object-cache drop-in has no
+  command hook).
 - **Workers** serving many requests from one process: Octane and the Symfony
   subscriber start each request's queries afresh on their own; elsewhere call
   `$platform->beginRequest()` as each request starts.

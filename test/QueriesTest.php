@@ -141,6 +141,16 @@ namespace Doctrine\DBAL\Driver\Middleware {
     }
 }
 
+// Predis' error reply, which TimedPredis looks for.
+namespace Predis\Response {
+    interface ErrorInterface
+    {
+    }
+    class Error implements ErrorInterface
+    {
+    }
+}
+
 namespace {
     foreach (glob(__DIR__ . '/../src/*.php') as $file) {
         require_once $file;
@@ -153,6 +163,8 @@ namespace {
     use AnalyticsPlatform\Queries;
     use AnalyticsPlatform\Symfony\QueryMiddleware;
     use AnalyticsPlatform\TimedPdo;
+    use AnalyticsPlatform\TimedPredis;
+    use AnalyticsPlatform\TimedRedis;
 
     $failed = 0;
     $checked = 0;
@@ -174,6 +186,11 @@ namespace {
     foreach ($cases['cases'] as $i => $case) {
         $got = Queries::normalize($case['statement'], $case['db']);
         check("case $i ({$case['db']}): " . substr($case['statement'], 0, 60) . ' gives ' . substr($got, 0, 60), $got === $case['expected']);
+    }
+    check('the shared Redis commands load', !empty($cases['redis_commands']));
+    foreach ($cases['redis_commands'] as $i => $case) {
+        $got = Queries::redisCommand($case['args']);
+        check("redis command $i: " . substr(json_encode($case['args']), 0, 60) . ' gives ' . json_encode($got), $got === $case['expected']);
     }
     // Beyond the shared cases: the parts of JavaScript's rule PHP does differently on its own.
     check('integer keys come first, as a JavaScript object has them', Queries::normalize('find t {"b":1,"10":2,"2":3,"01":4}', 'mongodb') === 'find t {"2":"?","10":"?","b":"?","01":"?"}');
@@ -563,6 +580,390 @@ namespace {
         && $byStatement['insert into "users" ("email") values (?)'][3] === 1);
     check('mongodb connections are left to the driver\'s subscriber', count($byStatement) === 2);
 
+    // ---- Redis -------------------------------------------------------------------------
+
+    // A client method as the command Redis gets: phpredis' and Predis' own orders.
+    $as = function ($method, array $params) {
+        return TimedRedis::statementOf($method, $params);
+    };
+    check('phpredis eval($script, $args, $numkeys) is EVAL with its first key', $as('eval', array('return 1', array('lock:order:9', 'hunter2'), 1)) === 'EVAL lock:order:?');
+    check('Predis eval($script, $numkeys, ...) too', $as('eval', array('return 1', 1, 'lock:order:9', 'hunter2')) === 'EVAL lock:order:?');
+    check('an array of keys is its first key', $as('mget', array(array('a:1', 'b:2'))) === 'MGET a:?' && $as('del', array(array('lock:1'))) === 'DEL lock:?');
+    check('an associative array is key, value', $as('mset', array(array('k:1' => 'v'))) === 'MSET k:?' && $as('hMSet', array('h:1', array('f' => 'v'))) === 'HMSET h:?');
+    check('the keys of ZUNION come with their count', $as('zunion', array(array('z:a', 'z:b'))) === 'ZUNION z:a');
+    check('phpredis xRead with a block is not timed, without one is', $as('xRead', array(array('jobs:email' => '>'), 10, 0)) === null
+        && $as('xRead', array(array('jobs:email' => '>'))) === 'XREAD jobs:email'
+        && $as('xReadGroup', array('g', 'c', array('jobs:email' => '>'), 1, 5000)) === null);
+    check('Predis xread with a block is not timed, without one is', $as('xread', array(10, 5000, array('s'))) === null
+        && $as('xread', array(10, null, array('s'))) === 'XREAD s');
+    check('rawCommand is the command itself', $as('rawCommand', array('GET', 'user:1')) === 'GET user:?');
+    check('phpredis\' older names are their commands', $as('delete', array('a:1')) === 'DEL a:?' && $as('lSize', array('q:1')) === 'LLEN q:?');
+    check('methods that send no command are not timed', $as('getOption', array(1)) === null && $as('_prefix', array('k')) === null && $as('connect', array('h')) === null);
+    check('blocking commands are not timed', $as('blPop', array(array('queue:default'), 5)) === null && $as('brpoplpush', array('a', 'b', 0)) === null);
+    check('Predis\' pipeline with a callback is PIPELINE, without one nothing', $as('pipeline', array(function () {
+    })) === 'PIPELINE' && $as('transaction', array(function () {
+    })) === 'MULTI' && $as('pipeline', array()) === null);
+    check('fcall($fn, $keys, $args) is FCALL with its first key, never an argument', $as('fcall', array('fn', array('user:1'), array('x'))) === 'FCALL user:?'
+        && $as('fcall', array('fn', array('42'), array('secret'))) === 'FCALL ?'
+        && TimedRedis::statementOf('fcall', array('fn', array('1'), 'secret'), true) === 'FCALL ?');
+    check('Predis eval_ro($script, $keys, ...$args) is its first key, phpredis eval_ro its num_keys', TimedRedis::statementOf('eval_ro', array('s', array('lock:1'), 'x'), true) === 'EVAL_RO lock:?'
+        && TimedRedis::statementOf('evalsha_ro', array('s', array(), '5', 'secret'), true) === 'EVALSHA_RO'
+        && $as('eval_ro', array('s', array('secret'), 0)) === 'EVAL_RO');
+    check('the package\'s own commands are not timed', Queries::untimed(function () use ($as) {
+        return $as('get', array('k'));
+    }) === null && $as('get', array('k')) === 'GET k');
+
+    class FakePhpRedis
+    {
+        public $error = null;
+        public $mode = 0;
+
+        public function getLastError()
+        {
+            return $this->error;
+        }
+
+        public function getOption($option)
+        {
+            return 1;
+        }
+
+        public function get($key)
+        {
+            if ($this->mode) {
+                return $this;
+            }
+            return $key === 'missing' ? false : 'v';
+        }
+
+        public function set($key, $value, $options = null)
+        {
+            return $this->mode ? $this : true;
+        }
+
+        public function lPush($key, $value)
+        {
+            if ($key === 'str') {
+                $this->error = 'WRONGTYPE Operation against a key holding the wrong kind of value';
+                return false;
+            }
+            return 1;
+        }
+
+        public function blPop($keys, $timeout)
+        {
+            return array();
+        }
+
+        public function ping()
+        {
+            throw new RuntimeException('Connection lost');
+        }
+
+        public function multi($mode = 1)
+        {
+            $this->mode = $mode;
+            return $this;
+        }
+
+        public function pipeline()
+        {
+            $this->mode = 2;
+            return $this;
+        }
+
+        public function exec()
+        {
+            $this->mode = 0;
+            return array(true, 'v');
+        }
+
+        public function scan(&$iterator, $pattern = null)
+        {
+            $iterator = 5;
+            return array('k');
+        }
+
+        public function discard()
+        {
+            $this->mode = 0;
+            return true;
+        }
+
+        public function connect($host)
+        {
+            $this->mode = 0;
+            return true;
+        }
+
+        public function client($opt, ...$args)
+        {
+            return 'id=1 ' . $opt;
+        }
+    }
+
+    $redisPlatform = hold(platformAt(storeOf('redis')));
+    $redisPlatform->beginRequest();
+    $redisPlatform->setRoute('/cart');
+    $redis = new TimedRedis(new FakePhpRedis());
+    $redis->get('user:42:cart');
+    $redis->get('user:43:cart');
+    check('a nil reply is a reply', $redis->get('missing') === false);
+    $redis->lPush('str', 'x');
+    $redis->set('session:abc123', 'hunter2');
+    $redis->blPop(array('queue:default'), 5);
+    $redis->getOption(1);
+    try {
+        $redis->ping();
+    } catch (RuntimeException $e) {
+        // counted as failed
+    }
+    $chained = $redis->multi()->set('a:1', 'x')->get('b:2');
+    $chained->exec();
+    check('a method that hands back the client hands back the stand-in', $chained === $redis);
+    $redis->pipeline()->get('c:3')->set('d:4', 'y')->exec();
+    $iterator = null;
+    $redis->scan($iterator);
+    check('scan() keeps its iterator by reference', $iterator === 5);
+    $redis->pipeline()->get('e:5');
+    $redis->discard();
+    // A multi() never ended, then a new connection: no group is open on it.
+    $redis->multi()->set('g:7', 'x');
+    $redis->connect('127.0.0.1');
+    $redis->get('f:6');
+    check('client() with arguments is phpredis\' CLIENT command, without the client', $redis->client('list') === 'id=1 list' && $redis->client() instanceof FakePhpRedis);
+    Queries::untimed(function () use ($redis) {
+        $redis->get('own:1');
+    });
+    $redisPlatform->recordAndSend();
+    $lines = spooled($redisPlatform);
+    $byStatement = array();
+    foreach (isset($lines[0]['q']) ? $lines[0]['q'] : array() as $q) {
+        $byStatement[$q[1]] = $q;
+    }
+    check('phpredis commands are timed as redis, by their key\'s shape', isset($byStatement['GET user:?:cart'])
+        && $byStatement['GET user:?:cart'][0] === 'redis' && $byStatement['GET user:?:cart'][2] === 2 && $byStatement['GET user:?:cart'][3] === 0);
+    check('an error reply (false with a new last error) failed, a nil reply didn\'t', $byStatement['LPUSH str'][3] === 1 && $byStatement['GET missing'][3] === 0);
+    check('a command that threw failed', $byStatement['PING'][3] === 1);
+    check('multi() to exec() is one MULTI call, pipeline() one PIPELINE', isset($byStatement['MULTI SET a:?']) && $byStatement['MULTI SET a:?'][2] === 1
+        && isset($byStatement['PIPELINE GET c:?']) && !isset($byStatement['GET b:?']) && !isset($byStatement['SET d:?']));
+    check('blocking, non-commands and our own are left out', !isset($byStatement['BLPOP queue:default']) && !isset($byStatement['GET own:?'])
+        && count($byStatement) === 10);
+    check('a reconnect ends a multi() left open: what follows is a call of its own', isset($byStatement['GET f:?']) && !isset($byStatement['MULTI SET g:?']));
+    check('a pipeline discarded sent nothing: not a call', !isset($byStatement['PIPELINE GET e:?']) && isset($byStatement['CLIENT LIST']));
+    check('no value or argument is kept', strpos(json_encode($lines), 'hunter2') === false && isset($byStatement['SET session:?']));
+
+    class FakePredisPipeline
+    {
+        public function set($key, $value)
+        {
+            return $this;
+        }
+
+        public function get($key)
+        {
+            return $this;
+        }
+
+        public function execute()
+        {
+            return array('OK', new Predis\Response\Error());
+        }
+    }
+
+    class FakePredisCommand
+    {
+        public function getId()
+        {
+            return 'HGET';
+        }
+
+        public function getArguments()
+        {
+            return array('profile:bob@x.com', 'name');
+        }
+    }
+
+    class FakePredis
+    {
+        public function get($key)
+        {
+            return $key === 'list:1' ? new Predis\Response\Error() : 'v';
+        }
+
+        public function brpop($keys, $timeout)
+        {
+            return null;
+        }
+
+        public function pipeline(...$args)
+        {
+            foreach ($args as $arg) {
+                if (is_callable($arg)) {
+                    $pipe = new FakePredisPipeline();
+                    $arg($pipe);
+                    return $pipe->execute();
+                }
+            }
+            return new FakePredisPipeline();
+        }
+
+        public function executeRaw(array $arguments, &$error = null)
+        {
+            $error = true;
+            return new Predis\Response\Error();
+        }
+
+        public function executeCommand($command)
+        {
+            return 'Bob';
+        }
+    }
+
+    $redisPlatform->beginRequest();
+    $predis = new TimedPredis(new FakePredis());
+    $predis->get('user:1');
+    $predis->get('list:1');
+    $predis->brpop(array('q'), 1);
+    $predis->pipeline()->set('a:1', 'x')->get('b:2')->execute();
+    $predis->pipeline(function ($pipe) {
+        $pipe->get('e:5');
+    });
+    $error = null;
+    $predis->executeRaw(array('GET', 'k:1'), $error);
+    check('executeRaw() keeps its $error by reference', $error === true);
+    $predis->executeCommand(new FakePredisCommand());
+    $redisPlatform->recordAndSend();
+    $lines = spooled($redisPlatform);
+    $byStatement = array();
+    foreach (isset($lines[1]['q']) ? $lines[1]['q'] : array() as $q) {
+        $byStatement[$q[1]] = $q;
+    }
+    check('Predis commands are timed, an error reply failed', $byStatement['GET user:?'][3] === 0 && $byStatement['GET list:?'][3] === 1);
+    check('a Predis pipeline to execute() is one call, failed by an error among its replies', isset($byStatement['PIPELINE SET a:?'])
+        && $byStatement['PIPELINE SET a:?'][2] === 1 && $byStatement['PIPELINE SET a:?'][3] === 1);
+    check('a pipeline with a callback is PIPELINE', isset($byStatement['PIPELINE']) && $byStatement['PIPELINE'][3] === 1);
+    check('executeRaw() and executeCommand() are timed', $byStatement['GET k:?'][3] === 1 && isset($byStatement['HGET profile:?']));
+    check('Predis\' blocking commands are left out', count($byStatement) === 6);
+
+    // Laravel: CommandExecuted, with its Redis events turned on.
+    class FakeRedisConnection
+    {
+        public $events = null;
+
+        public function getEventDispatcher()
+        {
+            return $this->events;
+        }
+
+        public function setEventDispatcher($events)
+        {
+            $this->events = $events;
+        }
+    }
+
+    class FakeRedisManager
+    {
+        public $enabled = false;
+        public $made;
+
+        public function __construct()
+        {
+            $this->made = array('default' => new FakeRedisConnection());
+        }
+
+        public function enableEvents()
+        {
+            $this->enabled = true;
+        }
+
+        public function connections()
+        {
+            return $this->made;
+        }
+    }
+
+    class FakeRedisApp extends FakeApp
+    {
+        public function resolved($name)
+        {
+            return isset($this->items[$name]);
+        }
+    }
+
+    class FakeQueueConnection
+    {
+        private $events;
+
+        public function __construct($events)
+        {
+            $this->events = $events;
+        }
+
+        // RedisQueue::size(): an eval, which Laravel announces.
+        public function size($queue)
+        {
+            $this->events->dispatch('Illuminate\\Redis\\Events\\CommandExecuted', (object) array('command' => 'eval',
+                'parameters' => array('return 1', array('queues:' . $queue, 'queues:' . $queue . ':delayed'), 3), 'time' => 0.4));
+            return 3;
+        }
+    }
+
+    class FakeQueueManager
+    {
+        private $events;
+
+        public function __construct($events)
+        {
+            $this->events = $events;
+        }
+
+        public function connection($name)
+        {
+            return new FakeQueueConnection($this->events);
+        }
+    }
+
+    require_once __DIR__ . '/../src/Laravel/QueueWatch.php';
+    $laravelRedis = hold(platformAt(storeOf('laravel-redis'), array('platform' => 'laravel')));
+    $redisEvents = new FakeEvents();
+    $manager = new FakeRedisManager();
+    $redisApp = new FakeRedisApp(array(
+        'events' => $redisEvents,
+        'redis' => $manager,
+        'queue' => new FakeQueueManager($redisEvents),
+        'config' => new FakeConfig(array()),
+    ));
+    $redisApp->made = array(Platform::class => $laravelRedis, Illuminate\Contracts\Debug\ExceptionHandler::class => new FakeHandler());
+    (new FirewallServiceProvider($redisApp))->boot();
+    check('the provider turns Laravel\'s Redis events on, for a connection made before too', $manager->enabled
+        && $manager->made['default']->events === $redisEvents);
+    $command = function ($name, array $parameters, $ms) use ($redisEvents) {
+        $redisEvents->dispatch('Illuminate\\Redis\\Events\\CommandExecuted', (object) array('command' => $name, 'parameters' => $parameters, 'time' => $ms, 'connectionName' => 'default'));
+    };
+    $laravelRedis->beginRequest();
+    $laravelRedis->setRoute('/basket');
+    $command('get', array('laravel_database_laravel_cache_:9f8e7d6c5b4a'), 1.25);
+    $command('set', array('session:abc123', 'hunter2', 'EX', 60), 0.75);
+    $command('blpop', array(array('queues:default'), 5), 5000.0);
+    $command('pipeline', array(function () {
+    }), 3.0);
+    $redisEvents->dispatch('Illuminate\\Redis\\Events\\CommandFailed', (object) array('command' => 'lpush', 'parameters' => array('str', 'x'),
+        'exception' => new RuntimeException('WRONGTYPE'), 'connectionName' => 'default'));
+    (new AnalyticsPlatform\Laravel\QueueWatch($redisApp))->read('redis', 'default');
+    $laravelRedis->recordAndSend();
+    $lines = spooled($laravelRedis);
+    $byStatement = array();
+    foreach (isset($lines[0]['q']) ? $lines[0]['q'] : array() as $q) {
+        $byStatement[$q[1]] = $q;
+    }
+    check('CommandExecuted is timed as redis, in Laravel\'s ms', isset($byStatement['GET laravel_database_laravel_cache_:?'])
+        && $byStatement['GET laravel_database_laravel_cache_:?'][0] === 'redis' && $byStatement['GET laravel_database_laravel_cache_:?'][4] == 1.25
+        && isset($byStatement['SET session:?']) && strpos(json_encode($lines), 'hunter2') === false);
+    check('Predis\' pipeline event is one PIPELINE call', isset($byStatement['PIPELINE']));
+    check('CommandFailed is a failed command', isset($byStatement['LPUSH str']) && $byStatement['LPUSH str'][3] === 1);
+    check('blocking commands and the queue readings are left out', !isset($byStatement['EVAL queues:?']) && count($byStatement) === 4);
+
     // ---- Symfony: the Doctrine middleware -----------------------------------------------
 
     class FakeResult implements Doctrine\DBAL\Driver\Result
@@ -697,7 +1098,7 @@ namespace {
         echo "SKIP: the WordPress plugin is not alongside this package\n";
     }
 
-    foreach (array('main', 'off', 'cli', 'caps', 'pdo', 'laravel', 'symfony') as $name) {
+    foreach (array('main', 'off', 'cli', 'caps', 'pdo', 'laravel', 'symfony', 'redis', 'laravel-redis') as $name) {
         cleanUp(storeOf($name));
     }
 

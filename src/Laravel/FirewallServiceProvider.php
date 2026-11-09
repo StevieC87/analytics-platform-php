@@ -7,7 +7,8 @@
 // limits count in the app's cache store, so APCu isn't needed. Every database
 // query is timed for Server speed (QueryExecuted, what DB::listen hears), and
 // every call of its Http client (its RequestSending and ResponseReceived
-// events), and the queues are read from queue:work (QueueWatch).
+// events), every Redis command (CommandExecuted, with Laravel's Redis events
+// turned on), and the queues are read from queue:work (QueueWatch).
 //
 // In your code: app(AnalyticsPlatform\Platform::class)->track('purchase', [...]).
 
@@ -16,6 +17,7 @@ namespace AnalyticsPlatform\Laravel;
 use AnalyticsPlatform\Firewall;
 use AnalyticsPlatform\Platform;
 use AnalyticsPlatform\Queries;
+use AnalyticsPlatform\TimedRedis;
 use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Contracts\Http\Kernel;
 use Illuminate\Support\Facades\Cache;
@@ -30,9 +32,12 @@ class FirewallServiceProvider extends ServiceProvider
             $config = $app['config']->get('analytics-firewall');
             $counter = null;
             if ($app['config']->get('cache.default') !== 'array') {
+                // The package's own: on a Redis cache, not timed.
                 $counter = function ($key, $ttl) {
-                    Cache::add($key, 0, $ttl);
-                    return (int) Cache::increment($key);
+                    return Queries::untimed(function () use ($key, $ttl) {
+                        Cache::add($key, 0, $ttl);
+                        return (int) Cache::increment($key);
+                    });
                 };
             }
             return new Platform(array(
@@ -69,6 +74,7 @@ class FirewallServiceProvider extends ServiceProvider
         $this->breadcrumbs();
         // And its queries are its own.
         $this->queries();
+        $this->redis();
         // Jobs added count in every process; the worker reads its queues.
         $this->queueBacklog();
         if ($this->app->runningInConsole()) {
@@ -253,6 +259,72 @@ class FirewallServiceProvider extends ServiceProvider
         $events->listen('Laravel\\Octane\\Events\\RequestReceived', function () {
             $this->app->make(Platform::class)->beginRequest();
         });
+    }
+
+    // Redis commands (queries.md, "Redis"): CommandExecuted, which Laravel
+    // fires for every command once its Redis events are on (enableEvents(),
+    // turned on here, for connections made before too), with its own time
+    // in ms. Each is "GET user:?:cart": the command and its first key's
+    // shape, never an argument or value. Laravel 12's CommandFailed is a
+    // failed command, with no time (0 ms); before Laravel 12 nothing says a
+    // command failed, and phpredis answers an error reply with false rather
+    // than an exception, so on phpredis those aren't seen as failed either.
+    // Predis' pipeline() and transaction() are one event, "PIPELINE" or
+    // "MULTI"; phpredis' run on the client itself, so Laravel announces none
+    // of their commands. Blocking commands (BLPOP, XREAD with a block...) and
+    // the package's own (the queue readings, the firewall's counter) aren't
+    // timed.
+    private function redis()
+    {
+        $config = $this->app['config'];
+        if (!$config->get('analytics-firewall.performance', true) || !$config->get('analytics-firewall.queries', true)) {
+            return;
+        }
+        $platform = null;
+        $record = function ($e, $ms, $failed) use (&$platform) {
+            try {
+                // A Predis connection's parameters are in Predis' order (its eval_ro).
+                $statement = TimedRedis::statementOf(isset($e->command) ? $e->command : null,
+                    isset($e->parameters) && is_array($e->parameters) ? $e->parameters : array(),
+                    isset($e->connection) && $e->connection instanceof \Illuminate\Redis\Connections\PredisConnection);
+                if ($statement === null) {
+                    return;
+                }
+                $platform = $platform ?: $this->app->make(Platform::class);
+                $platform->recordQuery('redis', $statement, $ms, $failed);
+            } catch (\Throwable $error) {
+                // untimed
+            }
+        };
+        $events = $this->app['events'];
+        $events->listen('Illuminate\\Redis\\Events\\CommandExecuted', function ($e) use ($record) {
+            $record($e, isset($e->time) ? (float) $e->time : 0.0, false);
+        });
+        $events->listen('Illuminate\\Redis\\Events\\CommandFailed', function ($e) use ($record) {
+            $record($e, 0.0, true);
+        });
+        $enable = function ($redis) use ($events) {
+            try {
+                if (!is_object($redis) || !method_exists($redis, 'enableEvents')) {
+                    return;
+                }
+                $redis->enableEvents();
+                // Connections made before have no dispatcher to fire with.
+                foreach (method_exists($redis, 'connections') ? (array) $redis->connections() : array() as $connection) {
+                    if (is_object($connection) && method_exists($connection, 'getEventDispatcher')
+                        && method_exists($connection, 'setEventDispatcher') && $connection->getEventDispatcher() === null) {
+                        $connection->setEventDispatcher($events);
+                    }
+                }
+            } catch (\Throwable $error) {
+                // untimed
+            }
+        };
+        if (method_exists($this->app, 'resolved') && $this->app->resolved('redis')) {
+            $enable($this->app['redis']);
+        } elseif (method_exists($this->app, 'afterResolving')) {
+            $this->app->afterResolving('redis', $enable);
+        }
     }
 
     // Job queues (sdk/protocols/queues.md), with Server speed: every
