@@ -1,7 +1,8 @@
 <?php
 // The WordPress plugin carries its own copy of every class in src/, because a
-// plugin cannot depend on Composer. Nothing copies them, so they drift — and
-// drift is silent: Platform builds each module inside a try/catch, so a class
+// plugin cannot depend on Composer. sdk/wordpress-plugin/build.sh recopies them
+// on every build, but lib/ in the tree goes stale between builds — and drift is
+// silent: Platform builds each module inside a try/catch, so a class
 // the plugin forgot to load just never runs, and a method the plugin's older
 // copy doesn't have only shows up as a fatal in WP-Cron once a day.
 //

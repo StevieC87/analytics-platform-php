@@ -3,8 +3,16 @@
   "description": "Firewall, error monitoring and server analytics for your PHP, Laravel or Symfony site, run from your analytics dashboard.",
   "type": "library",
   "license": "MIT",
+  "homepage": "https://sitegoose.com",
+  "support": {
+    "source": "https://github.com/StevieC87/analytics-platform-php",
+    "issues": "https://github.com/StevieC87/analytics-platform-php/issues",
+    "security": "https://sitegoose.com/security"
+  },
   "authors": [
-    { "name": "steviec87" }
+    {
+      "name": "steviec87"
+    }
   ],
   "keywords": [
     "firewall",

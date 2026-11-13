@@ -41,8 +41,11 @@ class Platform
     // posture: roots and the callbacks, see Posture). server_name names this
     // service for every module that sends one (errors, performance, crawlers,
     // resources, queries), so its errors and timings can be told apart from others'.
+    // Each of site_id, secret, endpoint and server_name left out (or empty), and
+    // trust_proxy left out, is read from the environment: see withEnvironment().
     public function __construct(array $options)
     {
+        $options = self::withEnvironment($options);
         $this->core = new Core($options);
         $this->options = $options;
         foreach (array('proxy', 'firewall', 'errors', 'analytics', 'performance', 'queries', 'queues', 'crawlers', 'forms', 'headers', 'audit', 'flags', 'maintenance', 'files', 'inventory', 'posture', 'resources') as $name) {
@@ -119,6 +122,70 @@ class Platform
             }
         }
         $this->core->setLoaded(array_keys($this->modules));
+    }
+
+    // The options, with what was left out read from the environment, as the
+    // Node, Python, Ruby and Go packages do: site_id, secret, endpoint and
+    // server_name when missing or empty, from ANALYTICS_SITE_ID,
+    // ANALYTICS_SITE_SECRET, ANALYTICS_ENDPOINT (or ANALYTICS_FIREWALL_ENDPOINT,
+    // Laravel's and Symfony's name for it) and ANALYTICS_SERVER_NAME (missing, empty or false); and
+    // trust_proxy when not given at all, from ANALYTICS_TRUST_PROXY
+    // ("cloudflare", or the number of proxies). Each is looked for in getenv(),
+    // $_ENV and $_SERVER, then in $file (start.php's lines of .env), so the
+    // server's own setting wins over the file. Never on WordPress: there, the
+    // plugin's settings page is the one place the keys come from.
+    public static function withEnvironment(array $options, array $file = array())
+    {
+        if (isset($options['platform']) && $options['platform'] === 'wordpress') {
+            return $options;
+        }
+        $read = function ($name) use ($file) {
+            $found = array(
+                getenv($name),
+                isset($_ENV[$name]) ? $_ENV[$name] : null,
+                isset($_SERVER[$name]) ? $_SERVER[$name] : null,
+                isset($file[$name]) ? $file[$name] : null,
+            );
+            foreach ($found as $value) {
+                if (is_string($value) && trim($value) !== '') {
+                    return trim($value);
+                }
+            }
+            return null;
+        };
+        $names = array(
+            'site_id' => array('ANALYTICS_SITE_ID'),
+            'secret' => array('ANALYTICS_SITE_SECRET'),
+            'endpoint' => array('ANALYTICS_ENDPOINT', 'ANALYTICS_FIREWALL_ENDPOINT'),
+            'server_name' => array('ANALYTICS_SERVER_NAME'),
+        );
+        foreach ($names as $key => $vars) {
+            // false too: what getenv() gives for a variable it can't see.
+            if (isset($options[$key]) && $options[$key] !== '' && $options[$key] !== false) {
+                continue;
+            }
+            foreach ($vars as $var) {
+                $value = $read($var);
+                if ($value !== null) {
+                    $options[$key] = $value;
+                    break;
+                }
+            }
+        }
+        if (!array_key_exists('trust_proxy', $options)) {
+            $trust = $read('ANALYTICS_TRUST_PROXY');
+            if ($trust !== null) {
+                $lower = strtolower($trust);
+                if ($lower === 'cloudflare') {
+                    $options['trust_proxy'] = 'cloudflare';
+                } elseif ($lower === 'true') {
+                    $options['trust_proxy'] = 1;
+                } elseif (ctype_digit($trust)) {
+                    $options['trust_proxy'] = (int) $trust;
+                }
+            }
+        }
+        return $options;
     }
 
     public function configured()
@@ -566,9 +633,10 @@ class Platform
         return isset($this->modules['analytics']) ? $this->modules['analytics']->track($name, $fields, $sessionId) : '';
     }
 
-    public function identify($userId, $sessionId = null)
+    // $traits: optional user properties, name => text, number or true/false.
+    public function identify($userId, $sessionId = null, $traits = array())
     {
-        return isset($this->modules['analytics']) ? $this->modules['analytics']->identify($userId, $sessionId) : false;
+        return isset($this->modules['analytics']) ? $this->modules['analytics']->identify($userId, $sessionId, $traits) : false;
     }
 
     public function lead(array $fields, $sessionId = null)

@@ -29,6 +29,12 @@ class Proxy
     // The tracker files, by name: anything else is refused, not forwarded.
     const FILES = array('track.js', 's.js', 'snapshot.js', 'replay.js', 'survey.js', 'banner.js',
         'leadform.js', 'notice.js', 'editor.js', 'picker.js', 'feedback.js', 'shield.js', 'widget.js', 'share.js');
+    // What a collector answer may be served as from the site's own domain.
+    // Its type comes from the collector, so anything but these three becomes
+    // plain text, and nosniff stops a browser guessing: a server that is no
+    // longer ours still can't answer <prefix>/api/... with a page that runs as
+    // the customer's own site. Shared cases: sdk/protocols/proxy-answer-cases.json.
+    const ANSWER_TYPES = array('application/json', 'text/plain', 'image/webp');
     // A pinned version never changes; /v<major>/ follows new releases, so it
     // is held for an hour, the same as the collector serves it with.
     const TTL_PINNED = 604800;
@@ -340,13 +346,25 @@ class Proxy
             // The tracker already treats a failed beacon as lost and carries on.
             return array('status' => 502, 'headers' => array(), 'body' => '');
         }
-        $pass = array();
-        foreach (array('content-type' => 'Content-Type', 'cache-control' => 'Cache-Control', 'retry-after' => 'Retry-After') as $key => $name) {
+        $pass = array(
+            'Content-Type' => self::answerType(isset($answer['headers']['content-type']) ? $answer['headers']['content-type'] : null),
+            'X-Content-Type-Options' => 'nosniff',
+        );
+        foreach (array('cache-control' => 'Cache-Control', 'retry-after' => 'Retry-After') as $key => $name) {
             if (isset($answer['headers'][$key])) {
                 $pass[$name] = $answer['headers'][$key];
             }
         }
         return array('status' => $answer['status'], 'headers' => $pass, 'body' => $answer['body']);
+    }
+
+    // The type a collector answer is served with: one of ANSWER_TYPES, or plain text.
+    public static function answerType($value)
+    {
+        $value = is_string($value) ? $value : '';
+        $parts = explode(';', $value, 2);
+        $kind = strtolower(trim($parts[0]));
+        return in_array($kind, self::ANSWER_TYPES, true) && preg_match('/^[\x20-\x7e]*\z/', $value) ? $value : 'text/plain; charset=utf-8';
     }
 
     // Sends it upstream. cURL when it exists (nearly always), else streams,

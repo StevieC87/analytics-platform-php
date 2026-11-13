@@ -50,15 +50,38 @@ class Analytics
         return $event['event_uid'];
     }
 
-    // Links the visit to your user ID (sent after the response).
-    public function identify($userId, $sessionId = null)
+    // Links the visit to your user ID (sent after the response). $traits:
+    // what you know about the user, name => text, number or true/false
+    // (array('plan' => 'pro', 'seats' => 5)); anything else is left out, and
+    // the collector cleans the names and values.
+    public function identify($userId, $sessionId = null, $traits = array())
     {
         $session = $sessionId === null ? Platform::sessionIdFromRequest() : (string) $sessionId;
         if ((string) $userId === '' || $session === '' || !$this->core->isOn('analytics')) {
             return false;
         }
-        $this->identities[] = array('user_id' => (string) $userId, 'session_id' => $session);
+        $identity = array('user_id' => (string) $userId, 'session_id' => $session);
+        $kept = self::scalarTraits($traits);
+        if ($kept) {
+            $identity['traits'] = $kept;
+        }
+        $this->identities[] = $identity;
         return true;
+    }
+
+    // The traits with a name that are text, a finite number or true/false.
+    public static function scalarTraits($traits)
+    {
+        $kept = array();
+        if (!is_array($traits)) {
+            return $kept;
+        }
+        foreach ($traits as $name => $value) {
+            if (is_string($name) && (is_string($value) || is_bool($value) || is_int($value) || (is_float($value) && is_finite($value)))) {
+                $kept[$name] = $value;
+            }
+        }
+        return $kept;
     }
 
     // $fields: email or phone, and name, status, tags, note, deal fields...

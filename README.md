@@ -9,6 +9,46 @@ Site Analytics plugin (`sdk/wordpress-plugin`), which is built on this.
 composer require analytics-platform/platform
 ```
 
+### The quick way: one line
+
+Put your keys in the server's environment, or in the `.env` in your project's
+folder (the one holding `vendor/`):
+
+```bash
+ANALYTICS_SITE_ID=YOUR_SITE_ID
+ANALYTICS_SITE_SECRET=YOUR_SITE_SECRET
+ANALYTICS_ENDPOINT=https://YOUR_COLLECTOR_URL
+```
+
+Then have PHP run the package's start file before every script, in `php.ini`,
+`.user.ini` or `.htaccess` (`php_value auto_prepend_file ...`):
+
+```ini
+auto_prepend_file = /path/to/your/site/vendor/analytics-platform/platform/start.php
+```
+
+or make it the first line of the script every request goes through:
+
+```php
+require __DIR__ . '/vendor/analytics-platform/platform/start.php';
+```
+
+That's all: the firewall, errors and the rest run on every request, before
+your code. `analytics_platform()` is the platform, for `track()`,
+`captureException()` and the rest. The server's environment wins over `.env`,
+only the `ANALYTICS_*` lines of `.env` are read, and they're never written
+into the environment. Behind a load balancer or Cloudflare, add
+`ANALYTICS_TRUST_PROXY=1` or `ANALYTICS_TRUST_PROXY=cloudflare` (see below).
+On the command line nothing runs until you call `analytics_platform()`.
+Laravel and Symfony have their own setup below.
+
+### Setting it up in code instead
+
+For options in code. Each of `site_id`, `secret`, `endpoint`, `server_name`
+and `trust_proxy` left out is read from the `ANALYTICS_*` environment
+variables above (`ANALYTICS_SERVER_NAME`, `ANALYTICS_TRUST_PROXY`), as is the
+endpoint's older name, `ANALYTICS_FIREWALL_ENDPOINT`.
+
 ```php
 $platform = new AnalyticsPlatform\Platform([
     'site_id'  => 'YOUR_SITE_ID',
@@ -21,9 +61,6 @@ $platform = new AnalyticsPlatform\Platform([
 ]);
 $platform->protect(); // as early as possible, before any output
 ```
-
-To protect every PHP file without touching your code, put those lines in a
-file and load it with `auto_prepend_file` in `php.ini` or `.user.ini`.
 
 **`trust_proxy` counts the proxies that add to `X-Forwarded-For`**, from the
 right; the hop it lands on is the visitor. A port on a hop
@@ -143,7 +180,7 @@ Nothing to configure: it comes with the firewall's rules, in every mode.
 
 ```php
 $platform->track('purchase', ['numeric_value' => '49.90', 'currency' => 'EUR', 'transaction_id' => $order->number]);
-$platform->identify($user->id);
+$platform->identify($user->id, null, ['plan' => 'pro', 'seats' => 5, 'trial' => false]); // traits are optional
 $platform->lead(['email' => 'ana@example.com', 'name' => 'Ana', 'status' => 'qualified']); // waits for the answer
 
 try {
@@ -153,6 +190,13 @@ try {
     throw $e;
 }
 ```
+
+`identify()` takes optional user traits as its third argument (the second is
+the session ID; `null` reads it from the request): name to text, number or
+`true`/`false`. Lists, objects and other values are left out. The collector
+does the rest: names are lowercased with spaces and dashes as `_` (up to 40
+letters, digits and `_`), text is cut at 200 characters, values that look like
+an email address are dropped, and at most 20 are kept.
 
 The visit is read from the `X-Analytics-Session` header (send
 `window.analyticsSession.getId()` with your requests) or the
@@ -342,9 +386,10 @@ Errors report too. Set in `.env`:
 ```
 ANALYTICS_SITE_ID=YOUR_SITE_ID
 ANALYTICS_SITE_SECRET=...
-ANALYTICS_FIREWALL_ENDPOINT=https://YOUR_COLLECTOR_URL
+ANALYTICS_ENDPOINT=https://YOUR_COLLECTOR_URL
 ```
 
+(`ANALYTICS_FIREWALL_ENDPOINT`, the endpoint's older name, still works.)
 In your code: `app(AnalyticsPlatform\Platform::class)->track('purchase', [...])`.
 The visitor's address is `$request->ip()`, so set up Laravel's trusted proxies
 if you're behind a load balancer or Cloudflare. The rate limit counts in your
@@ -361,8 +406,31 @@ protect only some routes, set `ANALYTICS_FIREWALL_GLOBAL=false` and add
 ## Symfony
 
 Symfony 6.4 or later. After `composer require analytics-platform/platform`,
-add these services to `config/services.yaml`, below the `_defaults` it
-already has:
+add one line to `config/bundles.php`:
+
+```php
+AnalyticsPlatform\Symfony\AnalyticsPlatformBundle::class => ['all' => true],
+```
+
+and the keys to `.env.local`: `ANALYTICS_SITE_ID`, `ANALYTICS_SITE_SECRET`
+and `ANALYTICS_ENDPOINT` (`ANALYTICS_FIREWALL_ENDPOINT`, its older name, works
+too). Until the keys are set the site runs as before. The bundle registers the
+platform, its rate limit counter and the subscriber; `HttpClientBreadcrumbs`
+when `symfony/http-client` is installed; and `QueryMiddleware` on every
+Doctrine connection when DBAL is. `LogProcessor` stays optional (below).
+
+Options, all optional, in `config/packages/analytics_platform.yaml`. Any option
+of the plain PHP package goes under `options`:
+
+```yaml
+analytics_platform:
+    protect_only: ['/admin', 'checkout', 'account_*']
+    options: { server_name: worker, firewall: { mode: monitor }, posture: { roots: ['%kernel.project_dir%/public'] } }
+```
+
+**Set up before the bundle?** The `services.yaml` block below still works on
+its own, with no bundle. With both, a service you define yourself is kept and
+the bundle's one of the same name is dropped, so nothing is registered twice.
 
 ```yaml
     AnalyticsPlatform\Platform:
@@ -379,15 +447,10 @@ already has:
     AnalyticsPlatform\Symfony\PlatformSubscriber: ~
     # With symfony/http-client: its requests in the steps before an error, and their times.
     AnalyticsPlatform\Symfony\HttpClientBreadcrumbs: ~
-    # Optional: also send the exceptions you log at error or above.
-    # AnalyticsPlatform\Symfony\LogProcessor: ~
     # With Doctrine DBAL 3.2 or later: every query's time (Server speed → Queries).
     AnalyticsPlatform\Symfony\QueryMiddleware:
         tags: [doctrine.middleware]
 ```
-
-and the same three keys as Laravel to `.env.local`. There is no bundle, so
-nothing goes in `bundles.php`. Until the keys are set the site runs as before.
 
 The subscriber runs before Symfony's own listeners on every request: the
 tracker's addresses, the firewall and maintenance mode, then the security
@@ -405,17 +468,19 @@ logins count for bot protection, and logins and logouts go to the audit log.
 In your code, ask for `AnalyticsPlatform\Platform` in a controller or service:
 `$platform->track('purchase', [...])`.
 
-- **Logged exceptions.** `LogProcessor` sends what you log with an exception
+- **Logged exceptions.** Register `AnalyticsPlatform\Symfony\LogProcessor: ~`
+  in `services.yaml` (with the bundle too). It sends what you log with an exception
   at error or above (`$logger->error('...', ['exception' => $e])`), from any
   channel, like Laravel's `ANALYTICS_CAPTURE_LOGS`. Needs MonologBundle, which
   picks it up on its own: nothing goes in `monolog.yaml`. One logged and then
   thrown is sent once.
-- **HttpClient.** `HttpClientBreadcrumbs` records each request your HttpClient
+- **HttpClient.** `HttpClientBreadcrumbs` (registered by the bundle when
+  `symfony/http-client` is installed) records each request your HttpClient
   makes (the default client and scoped ones): method, address without the query
   string, status, 0 when no answer came; and times each for Server speed →
-  Calls by its host. Leave the line out if you don't use `symfony/http-client`.
-- **Only some routes.** `protect_only: ['/admin', 'checkout', 'account_*']` under
-  `$options` puts the firewall and maintenance mode in front of those paths
+  Calls by its host.
+- **Only some routes.** `protect_only: ['/admin', 'checkout', 'account_*']`
+  (under `analytics_platform:`, or under `$options` in `services.yaml`) puts the firewall and maintenance mode in front of those paths
   (and everything below them) and route names (`*` at the end: every name that
   starts so) and nowhere else. Timing, errors and the tracker's addresses stay
   on everywhere.
@@ -429,9 +494,9 @@ In your code, ask for `AnalyticsPlatform\Platform` in a controller or service:
 
 The visitor's address is `$request->getClientIp()`, so set
 `framework.trusted_proxies` if you're behind a load balancer or Cloudflare.
-Every option of the plain PHP package goes under `$options` too:
-`server_name: worker`, `proxy: false`, `firewall: { mode: monitor }`,
-`posture: { roots: ['%kernel.project_dir%/public'] }`.
+Every option of the plain PHP package goes under `options:` (or `$options` in
+`services.yaml`): `server_name: worker`, `proxy: false`,
+`firewall: { mode: monitor }`, `posture: { roots: ['%kernel.project_dir%/public'] }`.
 
 ## Ad blockers
 

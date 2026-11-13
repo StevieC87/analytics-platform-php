@@ -224,6 +224,20 @@ $kept = lines($core->dir() . '/analytics.retry.jsonl');
 check('the converted event is sent (kept here, the collector is away)', count($kept) === 1 && $kept[0]['body']['events'][0]['meta'] === null);
 @unlink($core->dir() . '/analytics.retry.jsonl');
 
+// identify() traits: text, numbers and true/false pass through; the rest is left out.
+$analytics->identify('u1', 's1');
+$analytics->identify('u1', 's1', array('plan' => 'pro', 'Seats' => 5, 'ratio' => 0.5, 'trial' => false, 'tags' => array('a'), 'gone' => null, 'n' => NAN, 0 => 'x'));
+$analytics->identify('u1', 's1', array('tags' => array('a')));
+check('identify() without traits still queues', $analytics->identify('u1', 's1', null));
+$analytics->flush();
+$sent = array_map(function ($line) {
+    return $line['body'];
+}, lines($core->dir() . '/analytics.retry.jsonl'));
+check('an identify without traits has no traits field', count($sent) === 4 && !array_key_exists('traits', $sent[0]) && !array_key_exists('traits', $sent[3]));
+check('scalar traits are sent as given', $sent[1]['traits'] === array('plan' => 'pro', 'Seats' => 5, 'ratio' => 0.5, 'trial' => false));
+check('traits with nothing scalar left are left off', !array_key_exists('traits', $sent[2]));
+@unlink($core->dir() . '/analytics.retry.jsonl');
+
 // ---- 12. Message cap, spool size with the line ---------------------------------
 
 check('a message is cut to 2,000 characters', mb_strlen(Errors::cut(str_repeat('é', 5000)), 'UTF-8') === 2000);

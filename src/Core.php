@@ -12,7 +12,7 @@ namespace AnalyticsPlatform;
 
 class Core
 {
-    const VERSION = '0.3.6';
+    const VERSION = '0.3.8';
     const TIMEOUT = 4;
     const MIN_SYNC = 30;
     const RETRY = 60;
@@ -28,6 +28,19 @@ class Core
     // http()'s status when the body couldn't be written as JSON: nothing was
     // sent, and sending it again would fail the same way.
     const UNSENDABLE = -1;
+
+    // A dashboard header is added only when it is one of the nine the
+    // dashboard can produce (expresscollect/Analytics/platform.js, headersOf),
+    // in any case, with a value of visible ASCII, spaces and tabs, so no line
+    // break, control character or byte a server rejects gets through. A list
+    // of what's allowed, not of what isn't: whoever got into our servers still
+    // couldn't make this site grant another its users' data
+    // (Access-Control-Allow-*), send every page elsewhere (Refresh), log
+    // everyone out (Clear-Site-Data) or change what a response is. Shared
+    // cases: sdk/protocols/header-cases.json.
+    const SECURITY_HEADERS = array('strict-transport-security', 'x-content-type-options', 'x-frame-options',
+        'referrer-policy', 'permissions-policy', 'cross-origin-opener-policy', 'content-security-policy',
+        'content-security-policy-report-only', 'reporting-endpoints');
 
     public $options;
     // Appended to the User-Agent, e.g. " (no-rate)" when the firewall can't count.
@@ -240,17 +253,11 @@ class Core
         return $this->isOn('maintenance') && isset($switches['maintenance']) && is_array($switches['maintenance']) ? $switches['maintenance'] : array('on' => false);
     }
 
-    // A dashboard header is added only when it is well formed: a token name
-    // that isn't one of the headers that frame the response (a Content-Length
-    // or Transfer-Encoding of ours would desync it, a Set-Cookie or
-    // Content-Type would change what it is), and a value of visible ASCII,
-    // spaces and tabs, so no line break, control character or byte a server
-    // rejects gets through.
+    // One of SECURITY_HEADERS, with a well-formed value.
     public static function safeHeader($pair)
     {
         return is_array($pair) && count($pair) === 2 && isset($pair[0], $pair[1]) && is_string($pair[0]) && is_string($pair[1])
-            && preg_match('/^[A-Za-z][A-Za-z0-9-]{0,63}\z/', $pair[0])
-            && !in_array(strtolower($pair[0]), array('content-length', 'transfer-encoding', 'connection', 'set-cookie', 'content-type'), true)
+            && in_array(strtolower($pair[0]), self::SECURITY_HEADERS, true)
             && strlen($pair[1]) <= 4000 && preg_match('/^[\x20-\x7e\t]*\z/', $pair[1]);
     }
 

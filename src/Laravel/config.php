@@ -7,7 +7,7 @@ return [
     'site_id' => env('ANALYTICS_SITE_ID'),
     // Site settings in your dashboard. Keep it in .env, never in the browser.
     'secret' => env('ANALYTICS_SITE_SECRET'),
-    'endpoint' => env('ANALYTICS_FIREWALL_ENDPOINT'),
+    'endpoint' => env('ANALYTICS_FIREWALL_ENDPOINT', env('ANALYTICS_ENDPOINT')),
     // Names this service (web, worker…) on its errors and timings. Default: the host name.
     'server_name' => env('ANALYTICS_SERVER_NAME'),
     // 'monitor' or 'block' overrides the dashboard; empty follows it.
