@@ -313,8 +313,26 @@ class Firewall
     // of up to four from Challenge::cookieValues()) are for
     // the browser check: rule 'challenge', status 503, answered with
     // challengePage(). Left out, no request is checked.
+    // The request target as the app routes it: an absolute-form one ("GET
+    // http://host/admin", sent as if to a proxy) is routed by its path, so it
+    // is cut to "/admin"; matched as written it began "http:" and missed every
+    // rule on "/admin". "*" and a target already "/..." are kept as they are.
+    public static function originForm($target)
+    {
+        $text = (string) $target;
+        if ($text === '' || $text[0] === '/' || $text === '*') {
+            return $text;
+        }
+        $rest = preg_replace('~^[a-z][a-z0-9+.-]*://[^/?#]*~i', '', $text, 1, $count);
+        if (!$count) {
+            return $text;
+        }
+        return substr($rest, 0, 1) === '/' ? $rest : '/' . $rest;
+    }
+
     public function check($ip, $method = '', $path = '', $userAgent = '', $accept = '', $pass = '')
     {
+        $path = self::originForm($path);
         $allow = array('action' => 'allow', 'rule' => '', 'status' => 200);
         // A worker serving many requests (Octane): nothing of the last one's.
         $this->staticHit = null;
@@ -481,6 +499,7 @@ class Firewall
     // shape as check().
     public function checkAddress($ip, $method = '', $path = '', $userAgent = '')
     {
+        $path = self::originForm($path);
         $allow = array('action' => 'allow', 'rule' => '', 'status' => 200);
         $rules = $this->rules();
         if (!$rules || empty($rules['enabled'])) {

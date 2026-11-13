@@ -211,6 +211,19 @@ foreach (array_merge($notStatic, $static) as $i => list($target, $method)) {
     check('page limit, ' . substr($target, 0, 60), $limits->check($ip, $method, $target)['rule'] === ($counted ? 'limit:all' : ''));
 }
 
+// An absolute-form target ("GET http://host/admin") is routed by its path:
+// a rule on "/admin" must still match it.
+$absolute = $cases['base'];
+$absolute['requests'] = array('rules' => array(
+    array('id' => 'admin', 'action' => 'block', 'path' => array('prefix' => array('/admin'))),
+));
+list($wall) = wall($absolute, $shared);
+check('a rule on /admin blocks http://host/admin', $wall->check('198.51.100.7', 'GET', 'http://example.com/admin?x=1', 'Mozilla/5.0')['action'] === 'block');
+check('and HTTPS with a port', $wall->check('198.51.100.7', 'GET', 'HTTPS://example.com:8443/admin', 'Mozilla/5.0')['action'] === 'block');
+check('another page still passes', $wall->check('198.51.100.7', 'GET', 'http://example.com/blog', 'Mozilla/5.0')['action'] === 'allow');
+check('a host alone is the home page', Firewall::originForm('http://example.com') === '/' && Firewall::originForm('http://example.com?a=1') === '/?a=1');
+check('an origin-form target and "*" are kept', Firewall::originForm('/http://x') === '/http://x' && Firewall::originForm('*') === '*');
+
 foreach (array_merge(glob($core->dir() . '/*') ?: array(), glob($core->dir() . '/.[!.]*') ?: array()) as $path) {
     @unlink($path);
 }
