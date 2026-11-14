@@ -321,8 +321,8 @@ $flood = $crossSite->check('198.51.100.92', 'GET', '/', '', '', '', 'cross-site'
 check('a cross-site probe, request rule and flood are still refused', $probe['action'] === 'block' && $probe['status'] === 403
     && $ruled['action'] === 'block' && $ruled['rule'] === 'request:admin' && $flood['action'] === 'block' && $flood['status'] === 429);
 $tail = array_slice(lines($core->dir() . '/events.jsonl'), -3);
-check('but reported as monitor, so the collector bans no one', count($tail) === 3
-    && array_unique(array_column($tail, 'action')) === array('monitor'));
+check('but reported as refused, so the collector bans no one', count($tail) === 3
+    && array_unique(array_column($tail, 'action')) === array('refused'));
 $own = $crossSite->check('198.51.100.93', 'GET', '/.env', '', '', '', 'same-origin');
 $events = lines($core->dir() . '/events.jsonl');
 check('same-origin is as before', $own['action'] === 'block' && end($events)['action'] === 'block');

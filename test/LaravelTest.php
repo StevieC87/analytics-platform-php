@@ -178,7 +178,7 @@ check('the firewall runs straight after TrustProxies', array_search(FirewallMidd
 check('once only', AnalyticsPlatform\Laravel\FirewallServiceProvider::withFirewall($placed) === $placed);
 check('first when there is no TrustProxies', AnalyticsPlatform\Laravel\FirewallServiceProvider::withFirewall(array('X'))[0] === FirewallMiddleware::class);
 
-// Sec-Fetch-Site reaches the firewall: a cross-site probe is refused and reported as monitor.
+// Sec-Fetch-Site reaches the firewall: a cross-site probe is refused and reported as refused.
 $rules['probes'] = Firewall::compileProbes(array('exact' => array('/.env'), 'ban' => 600));
 $rules['mode'] = 'block';
 $platform->core()->writePhp('rules.php', $rules);
@@ -186,8 +186,8 @@ $crossSite = new FirewallMiddleware(new Platform(array('site_id' => 'a1b2c3d4e5f
     'endpoint' => 'http://127.0.0.1:9', 'storage' => $store, 'platform' => 'laravel', 'inventory' => false, 'resources' => false)));
 $refused = $crossSite->handle(new FakeRequest('GET', '/.env', array('Sec-Fetch-Site' => 'cross-site')), $app);
 $events = array_filter(explode("\n", (string) @file_get_contents($platform->core()->dir() . '/events.jsonl')));
-check('a cross-site probe is refused, reported as monitor', $refused->status === 403
-    && strpos((string) end($events), '"rule":"probe","action":"monitor"') !== false);
+check('a cross-site probe is refused, reported as refused', $refused->status === 403
+    && strpos((string) end($events), '"rule":"probe","action":"refused"') !== false);
 
 $rm = function ($dir) use (&$rm) {
     foreach (array_diff(scandir($dir) ?: array(), array('.', '..')) as $name) {
