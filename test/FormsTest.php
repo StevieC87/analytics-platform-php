@@ -80,6 +80,10 @@ foreach (array('password', 'pwd', 'passwd', 'user_pass', 'card', 'cc_number', 'c
                'birthday', 'licence', 'signature', 'private_notes', '_csrf', '_wpnonce') as $drop) {
     check("$drop is never sent", !isset($sent[$drop]));
 }
+// The browser's autofill names, and the same names with "-" for "_".
+$autofill = Forms::plainFields(array('cc-number' => 'x', 'cc-csc' => 'x', 'cc-exp' => 'x', 'cc-exp-month' => 'x',
+    'exp-year' => 'x', 'api-key' => 'x', 'security-code' => 'x', 'tax-id' => 'x', 'account-number' => 'x', 'cc-name' => 'Ann'));
+check('autofill and dashed names are never sent: ' . json_encode(array_keys($autofill)), array_keys($autofill) === array('cc-name'));
 
 // A card number typed into a field nobody thought to name "card".
 $odd = Forms::plainFields(array('field_12' => 'my card is 4111 1111 1111 1111 thanks'));

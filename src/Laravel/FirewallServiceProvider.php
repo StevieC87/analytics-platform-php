@@ -1,8 +1,8 @@
 <?php
 // Laravel: found by package discovery. Builds the platform (firewall, error
 // monitoring, server analytics) from config/analytics-firewall.php (the .env
-// keys there) and, unless 'global' is off, puts its middleware first in
-// every request. Errors Laravel reports go to the Errors report too, and
+// keys there) and, unless 'global' is off, puts its middleware in every
+// request, straight after TrustProxies. Errors Laravel reports go to the Errors report too, and
 // with 'capture_logs' the exceptions your code logs. Rate
 // limits count in the app's cache store, so APCu isn't needed. Every database
 // query is timed for Server speed (QueryExecuted, what DB::listen hears), and
@@ -82,7 +82,13 @@ class FirewallServiceProvider extends ServiceProvider
             return;
         }
         if ($this->app['config']->get('analytics-firewall.global')) {
-            $this->app->make(Kernel::class)->prependMiddleware(FirewallMiddleware::class);
+            $kernel = $this->app->make(Kernel::class);
+            if (method_exists($kernel, 'getGlobalMiddleware') && method_exists($kernel, 'setGlobalMiddleware')) {
+                $kernel->setGlobalMiddleware(self::withFirewall($kernel->getGlobalMiddleware()));
+            } else {
+                // An older kernel: last, which is after TrustProxies too.
+                $kernel->pushMiddleware(FirewallMiddleware::class);
+            }
         }
         // Failed logins (Laravel's auth) count for bot protection.
         if (class_exists('Illuminate\\Auth\\Events\\Failed')) {
@@ -131,6 +137,30 @@ class FirewallServiceProvider extends ServiceProvider
                 }
             });
         }
+    }
+
+    // The global middleware with the firewall in it: straight after
+    // TrustProxies, so $request->ip() is the visitor's and not the load
+    // balancer's (first, every ban and limit was the proxy's address, and one
+    // request for /.env banned every visitor at once), and first when the app
+    // has no TrustProxies, where the connection's address is the visitor's.
+    public static function withFirewall(array $middleware)
+    {
+        if (in_array(FirewallMiddleware::class, $middleware, true)) {
+            return $middleware;
+        }
+        $at = 0;
+        foreach (array_values($middleware) as $i => $entry) {
+            $class = is_string($entry) ? explode(':', $entry, 2)[0] : '';
+            if ($class !== '' && (is_a($class, 'Illuminate\\Http\\Middleware\\TrustProxies', true)
+                || is_a($class, 'Fideloper\\Proxy\\TrustProxies', true)
+                || substr($class, -strlen('\\TrustProxies')) === '\\TrustProxies')) {
+                $at = $i + 1;
+            }
+        }
+        $middleware = array_values($middleware);
+        array_splice($middleware, $at, 0, array(FirewallMiddleware::class));
+        return $middleware;
     }
 
     // What Laravel's HTTP client asked other services for: steps in the trail

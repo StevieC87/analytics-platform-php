@@ -39,6 +39,12 @@ namespace Psr\Cache {
     }
 }
 
+namespace Psr\Log {
+    interface LoggerInterface
+    {
+    }
+}
+
 namespace Symfony\Component\HttpKernel\Exception {
     interface HttpExceptionInterface
     {
@@ -605,6 +611,21 @@ namespace {
     check('below a listed path it checks before routing', $inside->response && $inside->response->getStatusCode() === 403);
     $scoped->onRouted($named);
     check('a listed route is checked once routed', $named->response && $named->response->getStatusCode() === 403);
+    // The router decodes the path before matching it: "/%61dmin" is "/admin".
+    $encoded = new FakeEvent(new FakeRequest('GET', '/%61dmin/users'));
+    $scoped->onRequest($encoded);
+    check('a listed path written encoded is checked before routing', $encoded->response && $encoded->response->getStatusCode() === 403);
+    // Whatever way it was written, a request routed below a listed path is checked once routed.
+    $odd = new FakeEvent(new FakeRequest('GET', '/x/../admin/users', 'admin_users'));
+    $scoped->onRequest($odd);
+    check('a path the listed prefix misses is let on to the router', $odd->response === null);
+    $routedScope = new PlatformSubscriber(new Platform(array('site_id' => 'a1b2c3d4e5f6a1b2c3d4e5f6', 'secret' => 'the-site-secret',
+        'endpoint' => 'http://127.0.0.1:9', 'storage' => $store . '/platform', 'platform' => 'symfony',
+        'inventory' => false, 'resources' => false, 'protect_only' => array('/users'))), $router);
+    $odd = new FakeEvent(new FakeRequest('GET', '/x/../users/9', 'user_show'));
+    $routedScope->onRequest($odd);
+    $routedScope->onRouted($odd);
+    check('and checked once the router took it to a listed path', $odd->response && $odd->response->getStatusCode() === 403);
 
     // ---- Logged exceptions ----
     $logged = new LogProcessor($platform);
@@ -678,7 +699,46 @@ namespace {
     $counter('afw:site:key:1', 120);
     $counter('afw:site:key:1', 120);
     check('without APCu the app\'s cache counts', function_exists('apcu_enabled') && apcu_enabled() ? true : $counter('afw:site:key:1', 120) === 3);
-    check('under a key a cache pool accepts', function_exists('apcu_enabled') && apcu_enabled() ? true : isset($pool->items['analytics_platform.afw.site.key.1']));
+    check('under a key a cache pool accepts', function_exists('apcu_enabled') && apcu_enabled() ? true : isset($pool->items['analytics_platform.' . sha1('afw:site:key:1')]));
+    // PSR-6 reserves {}()/\@: an IPv6 visitor's key ("2001:db8::/64") has a "/".
+    $strict = new class implements Psr\Cache\CacheItemPoolInterface {
+        public $inner;
+
+        public function getItem($key)
+        {
+            if (strpbrk($key, '{}()/\\@:') !== false) {
+                throw new \InvalidArgumentException('reserved character in ' . $key);
+            }
+            return $this->inner->getItem($key);
+        }
+
+        public function save($item)
+        {
+            return $this->inner->save($item);
+        }
+    };
+    $strict->inner = $pool;
+    $v6 = new CacheCounter($strict);
+    $v6('afw:rate:site:2001:db8:1:2::/64', 60);
+    check('an IPv6 visitor is counted too', function_exists('apcu_enabled') && apcu_enabled() ? true : $v6('afw:rate:site:2001:db8:1:2::/64', 60) === 2);
+    $logged = new class implements Psr\Log\LoggerInterface {
+        public $lines = array();
+
+        public function warning($message, array $context = array())
+        {
+            $this->lines[] = $message;
+        }
+    };
+    $broken = new class implements Psr\Cache\CacheItemPoolInterface {
+        public function getItem($key)
+        {
+            throw new \RuntimeException('cache down');
+        }
+    };
+    $failing = new CacheCounter($broken, $logged);
+    $failing('k', 60);
+    check('a counter that fails counts 0, and says so once', function_exists('apcu_enabled') && apcu_enabled() ? true
+        : $failing('k', 60) === 0 && count($logged->lines) === 1 && strpos($logged->lines[0], 'cache down') !== false);
     check('with no cache at all it counts nothing (no rate limit)', function_exists('apcu_enabled') && apcu_enabled() ? true : (new CacheCounter())('k', 60) === 0);
 
     foreach (array($dir, $routerCache) as $folder) {

@@ -121,11 +121,15 @@ foreach (AnalyticsPlatform\Firewall::RULES as $list) {
     $rules[$list] = AnalyticsPlatform\Firewall::compileList($list === 'deny' ? array('203.0.113.0/24') : array());
 }
 file_put_contents($cacheDir . '/rules.php', "<?php\nreturn " . var_export($rules, true) . ";\n");
+// As the package writes it: a rules file others could write to is never run.
+chmod($cacheDir . '/rules.php', 0600);
 $out = run($px, '/api/e', 'POST');
 check('a denied address is refused before anything is forwarded', strpos($out, 'Forbidden') !== false);
 check('and reported for the dashboard', strpos((string) @file_get_contents($cacheDir . '/events.jsonl'), '"rule":"deny"') !== false);
 $rules['mode'] = 'monitor';
 file_put_contents($cacheDir . '/rules.php', "<?php\nreturn " . var_export($rules, true) . ";\n");
+// As the package writes it: a rules file others could write to is never run.
+chmod($cacheDir . '/rules.php', 0600);
 check('in monitor mode it is only reported', strpos(run($px, '/api/e', 'POST'), 'Forbidden') === false);
 
 foreach (array($configFile, $cacheDir . '/px-' . hash('sha256', 'v1/s.js') . '.js') as $path) {
@@ -167,6 +171,26 @@ check('the proxy key is worked out as the collector does',
     AnalyticsPlatform\Proxy::keyFor('0123456789abcdef01234567') === '8fc74dbbd4f088449862841cd29fcaee');
 check('the path comes from the secret, not the site id', $prefix === AnalyticsPlatform\Proxy::prefixFor('s3cret')
     && $prefix !== AnalyticsPlatform\Proxy::prefixFor('other'));
+
+// An endpoint a sub-site's administrator may set (WordPress networks) is
+// called only when it is https on public addresses: the proxy hands back
+// what it fetched, so an internal address would be read out from outside.
+foreach (array('http://8.8.8.8', 'https://127.0.0.1', 'https://10.1.2.3', 'https://192.168.0.1', 'https://169.254.169.254',
+    'https://[::1]', 'https://[fe80::1]', 'https://[::ffff:127.0.0.1]', 'https://localhost', 'https://u:p@8.8.8.8', 'ftp://8.8.8.8', 'https://') as $url) {
+    check("$url is not called", AnalyticsPlatform\Proxy::publicTarget($url) === null);
+}
+$target = AnalyticsPlatform\Proxy::publicTarget('https://8.8.8.8:8443/x');
+check('a public address is, pinned to it', $target === array('host' => '8.8.8.8', 'port' => 8443, 'ip' => '8.8.8.8'));
+$pinned = AnalyticsPlatform\Proxy::curlPinned(array('host' => 'collector.example', 'port' => 443, 'ip' => '2001:db8::1'));
+check('the name is resolved to the address checked, and redirects are not followed',
+    $pinned[CURLOPT_RESOLVE] === array('collector.example:443:[2001:db8::1]') && $pinned[CURLOPT_FOLLOWLOCATION] === false);
+$headers = array();
+list($streamUrl, $ssl) = AnalyticsPlatform\Proxy::streamPinned('https://collector.example/v1/s.js', array('host' => 'collector.example', 'port' => 443, 'ip' => '203.0.113.9'), $headers);
+check('without cURL too', $streamUrl === 'https://203.0.113.9:443/v1/s.js' && $headers === array('Host: collector.example')
+    && $ssl === array('peer_name' => 'collector.example'));
+$started = microtime(true);
+$inside = (new AnalyticsPlatform\Proxy('https://127.0.0.1:1', 's3cret', '', '', '', true))->handle('api', 'e', 'POST', '', array(), '{}', '203.0.113.9');
+check('a proxy limited to public endpoints asks nothing of an internal one', $inside['status'] === 502 && microtime(true) - $started < 0.5);
 
 echo ($failed ? "FAILED: " : "OK: ") . "$checked checks, $failed failed\n";
 exit($failed ? 1 : 0);

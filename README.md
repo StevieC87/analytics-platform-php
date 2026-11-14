@@ -57,7 +57,7 @@ $platform = new AnalyticsPlatform\Platform([
     // 'trust_proxy' => 1,            // behind Nginx or a load balancer
     // 'trust_proxy' => 'cloudflare', // every request through Cloudflare (CF-Connecting-IP is
     //                                // believed only from Cloudflare's own addresses)
-    // 'storage' => '/var/cache/analytics-platform', // default: the system temp dir
+    // 'storage' => '/var/cache/analytics-platform', // default: a folder of this user's in the system temp dir
 ]);
 $platform->protect(); // as early as possible, before any output
 ```
@@ -113,8 +113,16 @@ They can also be switched off in the dashboard (Security → Server package).
   named after your site id *and* a hash of your secret, so its address can't be
   worked out from the site id in your pages, and an `.htaccess` denying
   everything is written next to the files — but nginx ignores `.htaccess`, so a
-  folder outside the web root is the only real answer. The default (the system
-  temp directory) already is one.
+  folder outside the web root is the only real answer.
+- **Only this user can read or write it.** The rules and switches in it are run
+  as PHP, and the switches hold maintenance mode's bypass code, so its folder is
+  made 0700 and its files 0600, and nothing is read from (or written to) a
+  folder or file that another user owns, that others can write to, or that is a
+  link. The default storage is under the system temp directory, which every
+  local user can write to, so it is a folder named after the user PHP runs as
+  (`analytics-firewall-<uid>`); on shared hosting, a `storage` of your own
+  outside the web root is still the better place. Nothing is kept until the
+  site id, secret and endpoint are all set.
 - **Fails open.** No rules yet, or our service unreachable: requests pass.
 - **Rate limit** needs a counter shared between requests: the APCu extension,
   or your own (`'counter' => function ($key, $ttl) { ... return $hits; }`).

@@ -85,7 +85,9 @@ class FirewallMiddleware
                 // middleware on a route group), the cookie bag holds null for
                 // a cookie Laravel didn't encrypt, as this one is set by script.
                 // Every Cookie header: a server may pass a second one apart.
-                Challenge::cookieValues(Challenge::cookieHeaderOf($request->headers->all()))
+                Challenge::cookieValues(Challenge::cookieHeaderOf($request->headers->all())),
+                // Another site's page made the browser ask: refused, never banned.
+                (string) $request->headers->get('Sec-Fetch-Site')
             );
             // The browser check: its page sets the pass and reloads.
             $page = $decision['rule'] === 'challenge' ? $firewall->challengePage((string) $request->ip(), $request->method()) : null;

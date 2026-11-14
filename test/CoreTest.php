@@ -52,6 +52,89 @@ check('a value survives being written and read', is_array($back) && $back['fetch
 $escape = new Core(array('site_id' => '../../../../etc/passwd') + $options);
 check('a site id cannot climb out of the storage folder', strpos($escape->dir(), '..') === false);
 
+// What is kept is this user's alone: the folder 0700, its files 0600
+// (switches.php holds maintenance mode's bypass code).
+if (DIRECTORY_SEPARATOR === '/') {
+    check('the folder is closed to other users', (fileperms($core->dir()) & 0777) === 0700);
+    check('and what is written in it', (fileperms($core->dir() . '/switches.php') & 0777) === 0600);
+    $core->append('mode', array('n' => 1), 1000);
+    clearstatcache();
+    check('a spool too', (fileperms($core->dir() . '/mode.jsonl') & 0777) === 0600);
+    @unlink($core->dir() . '/mode.jsonl');
+    // A file others could have written is never run.
+    chmod($core->dir() . '/switches.php', 0666);
+    check('a file others can write to is not included', (new Core($options))->readPhp('switches.php') === null);
+    chmod($core->dir() . '/switches.php', 0600);
+    @symlink($core->dir() . '/switches.php', $core->dir() . '/linked.php');
+    check('nor a link', (new Core($options))->readPhp('linked.php') === null);
+    @unlink($core->dir() . '/linked.php');
+    // A folder an older version made 0775 is closed on first use.
+    chmod($core->dir(), 0775);
+    check('an open folder of ours is closed', (new Core($options))->readPhp('switches.php') !== null && (fileperms($core->dir()) & 0777) === 0700);
+}
+
+// Without the secret the name could be worked out from the site id, so
+// there is no folder at all until the package is configured, and nothing
+// is spooled.
+$bare = new Core(array('secret' => '') + $options);
+check('no secret, no folder', $bare->dir() === '' && !$bare->ensureDir() && $bare->readPhp('switches.php') === null);
+$bare->post('test', '/events/test', array('rows' => array(1)));
+check('and nothing is spooled', !$bare->append('test', array('n' => 1), 1000) && !$bare->waiting('test')
+    && glob($store . '/*.jsonl') === array());
+// A folder named from an empty secret (older versions spooled into one) is
+// emptied once the secret is set, as the guessable one is.
+$other = 'b1b2c3d4e5f6a1b2c3d4e5f6';
+$empty = $store . '/' . $other . '-' . substr(hash('sha256', $other . '|'), 0, 16);
+@mkdir($empty, 0700, true);
+file_put_contents($empty . '/analytics.retry.jsonl', "{}\n");
+// And the old guessable one may be a link another user made to somewhere of
+// the site's: nothing it points at is touched.
+$victim = $store . '/victim';
+@mkdir($victim, 0700, true);
+file_put_contents($victim . '/index.php', '<?php');
+@symlink($victim, $store . '/' . $other);
+$named = new Core(array('site_id' => $other) + $options);
+check('a site whose old folders are odd still gets its own', $named->ensureDir());
+check('the folder named from an empty secret is emptied', !file_exists($empty . '/analytics.retry.jsonl') && !is_dir($empty));
+check('a link where the old folder was is not followed', is_file($victim . '/index.php') && is_link($store . '/' . $other));
+@unlink($store . '/' . $other);
+@unlink($victim . '/index.php');
+@rmdir($victim);
+foreach (glob($named->dir() . '/{,.}*', GLOB_BRACE) ?: array() as $path) {
+    is_file($path) && @unlink($path);
+}
+@rmdir($named->dir());
+
+// No storage given: under the system temp folder, in one of this user's
+// own, which another user can't have made first or swapped for a link.
+if (DIRECTORY_SEPARATOR === '/' && function_exists('posix_geteuid')) {
+    $tmp = $store . '-tmp';
+    @mkdir($tmp, 0777, true);
+    chmod($tmp, 01777);
+    $child = function ($code) use ($tmp) {
+        $script = $tmp . '/child.php';
+        file_put_contents($script, "<?php require " . var_export(__DIR__ . '/../src/Core.php', true) . ";\n" . $code);
+        return trim((string) shell_exec('TMPDIR=' . escapeshellarg($tmp) . ' ' . escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg($script)));
+    };
+    $make = '$c = new AnalyticsPlatform\Core(array("site_id" => "' . $id . '", "secret" => "s", "endpoint" => "https://c.example"));';
+    $own = $tmp . '/analytics-firewall-' . posix_geteuid();
+    check('a new install keeps its files in a folder of its user\'s',
+        $child($make . ' echo $c->ensureDir() ? dirname($c->dir()) : "no";') === $own && (fileperms($own) & 0777) === 0700);
+    // The shared name, made by someone else first, is not used.
+    $rm = function ($dir) use (&$rm) {
+        foreach (array_diff(scandir($dir) ?: array(), array('.', '..')) as $name) {
+            is_dir($dir . '/' . $name) && !is_link($dir . '/' . $name) ? $rm($dir . '/' . $name) : @unlink($dir . '/' . $name);
+        }
+        @rmdir($dir);
+    };
+    $rm($own);
+    @mkdir($tmp . '/elsewhere', 0700);
+    @symlink($tmp . '/elsewhere', $own);
+    check('a link in its place is refused, and nothing is kept', $child($make . ' echo $c->ensureDir() ? "yes" : "no";') === 'no'
+        && scandir($tmp . '/elsewhere') === array('.', '..'));
+    $rm($tmp);
+}
+
 // The collector's answers, scripted: http() is the one way out.
 class ScriptedCore extends Core
 {

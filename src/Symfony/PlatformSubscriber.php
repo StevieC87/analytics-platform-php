@@ -134,13 +134,22 @@ class PlatformSubscriber implements EventSubscriberInterface, CacheWarmerInterfa
             return;
         }
         $only = $this->only();
-        if ($only === null || self::pathListed($only, $request->getPathInfo())) {
+        if ($only === null || self::pathListed($only, self::routedPathInfo($request))) {
             $this->protect($event, $request);
         }
     }
 
-    // With 'protect_only', the routes it names by name; and for every request
-    // the route's path, so errors captured during it carry it.
+    // The path as the router matches it: getPathInfo() is as sent, and the
+    // UrlMatcher decodes it first, so "/%61dmin" is routed to "/admin".
+    private static function routedPathInfo($request)
+    {
+        return rawurldecode((string) $request->getPathInfo());
+    }
+
+    // With 'protect_only', the routes it names by name, and its paths once
+    // more against the route the router matched: whatever way the address
+    // was written, a request routed below a listed path is checked. And for
+    // every request the route's path, so errors captured during it carry it.
     public function onRouted($event)
     {
         if (!$event->isMainRequest() || !$this->platform->configured() || $event->getRequest()->attributes->get(self::PROXIED)) {
@@ -152,7 +161,9 @@ class PlatformSubscriber implements EventSubscriberInterface, CacheWarmerInterfa
         $this->platform->setRoute($route);
         $only = $this->only();
         if ($only !== null && !$request->attributes->get(self::CHECKED)
-            && self::routeListed($only, (string) $request->attributes->get('_route'))) {
+            && (self::routeListed($only, (string) $request->attributes->get('_route'))
+                || self::pathListed($only, self::routedPathInfo($request))
+                || ($route !== '' && self::pathListed($only, $route)))) {
             $this->protect($event, $request);
         }
     }
@@ -167,7 +178,9 @@ class PlatformSubscriber implements EventSubscriberInterface, CacheWarmerInterfa
                 $decision = $firewall->check((string) $request->getClientIp(), $request->getMethod(), $request->getRequestUri(),
                     (string) $request->headers->get('User-Agent'), (string) $request->headers->get('Accept'),
                     // Every Cookie header: a server may pass a second one apart.
-                    Challenge::cookieValues(Challenge::cookieHeaderOf($request->headers->all())));
+                    Challenge::cookieValues(Challenge::cookieHeaderOf($request->headers->all())),
+                    // Another site's page made the browser ask: refused, never banned.
+                    (string) $request->headers->get('Sec-Fetch-Site'));
                 // The browser check: its page sets the pass and reloads.
                 $page = $decision['rule'] === 'challenge' ? $firewall->challengePage((string) $request->getClientIp(), $request->getMethod()) : null;
             } catch (\Throwable $e) {

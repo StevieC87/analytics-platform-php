@@ -307,6 +307,26 @@ $keys = array();
 $rate = new Firewall($options + array('counter' => $counter));
 check('the proxy check is the address only, never the rate', $rate->checkAddress('203.0.113.77', 'POST', '/x/api/e')['action'] === 'allow' && $keys === array());
 
+// ---- Requests another site made the browser send: refused, never banned -----------
+
+$rules['deny'] = array();
+$core->writePhp('rules.php', $rules);
+$keys = array();
+$crossSite = new Firewall($options + array('counter' => $counter));
+$probe = $crossSite->check('198.51.100.90', 'GET', '/.env', '', '', '', 'Cross-Site');
+$ruled = $crossSite->check('198.51.100.91', 'GET', '/admin/x', '', '', '', 'same-site');
+$crossSite->check('198.51.100.92', 'GET', '/', '', '', '', 'cross-site');
+$crossSite->check('198.51.100.92', 'GET', '/', '', '', '', 'cross-site');
+$flood = $crossSite->check('198.51.100.92', 'GET', '/', '', '', '', 'cross-site');
+check('a cross-site probe, request rule and flood are still refused', $probe['action'] === 'block' && $probe['status'] === 403
+    && $ruled['action'] === 'block' && $ruled['rule'] === 'request:admin' && $flood['action'] === 'block' && $flood['status'] === 429);
+$tail = array_slice(lines($core->dir() . '/events.jsonl'), -3);
+check('but reported as monitor, so the collector bans no one', count($tail) === 3
+    && array_unique(array_column($tail, 'action')) === array('monitor'));
+$own = $crossSite->check('198.51.100.93', 'GET', '/.env', '', '', '', 'same-origin');
+$events = lines($core->dir() . '/events.jsonl');
+check('same-origin is as before', $own['action'] === 'block' && end($events)['action'] === 'block');
+
 // ---- 3. Bans and failed logins by /64, with APCu (where it is loaded) ------------
 
 if (function_exists('apcu_enabled') && apcu_enabled()) {
@@ -324,6 +344,8 @@ if (function_exists('apcu_enabled') && apcu_enabled()) {
     check('failed logins count by /64', $apcu->check('2001:db8:0:4::3', 'GET', '/')['rule'] === 'ban');
     $apcu->check('::ffff:198.51.100.80', 'GET', '/.env');
     check('a mapped address is banned as its IPv4', $apcu->check('198.51.100.80', 'GET', '/')['rule'] === 'ban');
+    $apcu->check('198.51.100.81', 'GET', '/.env', '', '', '', 'cross-site');
+    check('a cross-site probe bans no one here', $apcu->check('198.51.100.81', 'GET', '/')['rule'] === '');
     $apcuProxy = new Proxy('http://127.0.0.1:1', 'other-secret', '');
     for ($i = 0; $i < Proxy::BREAKER_FAILURES; $i++) {
         $apcuProxy->handle('api', 'e', 'POST', '', array(), '{}', '203.0.113.9');

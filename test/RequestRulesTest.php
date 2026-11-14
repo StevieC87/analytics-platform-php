@@ -127,5 +127,47 @@ if (RequestRules::matchRequest($routedRule, '', '', '', $prepared) !== RequestRu
     echo "FAIL a prepared request should match as the raw one does\n";
 }
 
+// A regex past 2,000 characters: searched in windows, its anchors only at
+// the part's own ends, never at a window's.
+$windowed = function ($pattern, $path) {
+    $rules = RequestRules::compile(array('rules' => array(array('id' => 'r', 'action' => 'block', 'path' => array('regex' => $pattern)))));
+    return RequestRules::matchRequest($rules, 'GET', $path, '') !== null;
+};
+$long = '/' . str_repeat('a/', 1500);
+foreach (array(
+    array('/evil', $long . 'evil/' . str_repeat('b/', 1500), true, 'found in a middle window'),
+    array('^/evil', $long . 'evil', false, '"^" is the start of the part, not of a window'),
+    array('^/a/a', $long . 'evil', true, '"^" still matches at the start'),
+    array('/evil$', $long . 'evil/x', false, '"$" is the end of the part'),
+    array('/evil$', $long . 'evil', true, '"$" matches at the end'),
+    array('/evil\\$', $long . '/evil$/' . str_repeat('b/', 1500), true, 'an escaped "$" is no anchor'),
+    array('^/a[a/]*z$', $long . 'z', false, 'both anchors need one window to be the whole part'),
+    array('^/a[a/]*z$', '/a/a/z', true, 'which a short part is'),
+) as $case) {
+    $checked++;
+    if ($windowed($case[0], $case[1]) !== $case[2]) {
+        $failed++;
+        printf("FAIL %s: %s\n", $case[3], $case[0]);
+    }
+}
+$checked++;
+$prepared = RequestRules::prepare('GET', '/login#x?y=1', '');
+if ($prepared['path'] !== '/login' || $prepared['query'] !== '') {
+    $failed++;
+    echo "FAIL a # before the ? ends the path and leaves no query\n";
+}
+
+// The request line's target in origin form (Firewall::originForm), the
+// shared `targets` cases.
+require_once __DIR__ . '/../src/Firewall.php';
+foreach (isset($cases['targets']) ? $cases['targets'] : array() as $case) {
+    $checked++;
+    $got = AnalyticsPlatform\Firewall::originForm($case['target']);
+    if ($got !== $case['origin']) {
+        $failed++;
+        printf("FAIL originForm(%s): expected %s, got %s\n", $case['target'], $case['origin'], $got);
+    }
+}
+
 printf("%d checks, %d failed\n", $checked, $failed);
 exit($failed ? 1 : 0);

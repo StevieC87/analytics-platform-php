@@ -165,6 +165,30 @@ $fresh = new FirewallMiddleware(new Platform(array('site_id' => 'a1b2c3d4e5f6a1b
 check('without challenge in the rules a page load goes on to the app',
     $fresh->handle(new FakeRequest('GET', '/pricing', array('Accept' => $html)), $app)->content === 'the app');
 
+// The global middleware: the firewall straight after TrustProxies, so it
+// reads the visitor's address rather than the load balancer's.
+if (!class_exists('Illuminate\\Support\\ServiceProvider')) {
+    eval('namespace Illuminate\\Support; abstract class ServiceProvider {}');
+}
+require_once __DIR__ . '/../src/Laravel/FirewallServiceProvider.php';
+$global = array('Illuminate\\Foundation\\Http\\Middleware\\InvokeDeferredCallbacks', 'App\\Http\\Middleware\\TrustProxies',
+    'Illuminate\\Http\\Middleware\\HandleCors');
+$placed = AnalyticsPlatform\Laravel\FirewallServiceProvider::withFirewall($global);
+check('the firewall runs straight after TrustProxies', array_search(FirewallMiddleware::class, $placed, true) === 2 && count($placed) === 4);
+check('once only', AnalyticsPlatform\Laravel\FirewallServiceProvider::withFirewall($placed) === $placed);
+check('first when there is no TrustProxies', AnalyticsPlatform\Laravel\FirewallServiceProvider::withFirewall(array('X'))[0] === FirewallMiddleware::class);
+
+// Sec-Fetch-Site reaches the firewall: a cross-site probe is refused and reported as monitor.
+$rules['probes'] = Firewall::compileProbes(array('exact' => array('/.env'), 'ban' => 600));
+$rules['mode'] = 'block';
+$platform->core()->writePhp('rules.php', $rules);
+$crossSite = new FirewallMiddleware(new Platform(array('site_id' => 'a1b2c3d4e5f6a1b2c3d4e5f6', 'secret' => 'the-site-secret',
+    'endpoint' => 'http://127.0.0.1:9', 'storage' => $store, 'platform' => 'laravel', 'inventory' => false, 'resources' => false)));
+$refused = $crossSite->handle(new FakeRequest('GET', '/.env', array('Sec-Fetch-Site' => 'cross-site')), $app);
+$events = array_filter(explode("\n", (string) @file_get_contents($platform->core()->dir() . '/events.jsonl')));
+check('a cross-site probe is refused, reported as monitor', $refused->status === 403
+    && strpos((string) end($events), '"rule":"probe","action":"monitor"') !== false);
+
 $rm = function ($dir) use (&$rm) {
     foreach (array_diff(scandir($dir) ?: array(), array('.', '..')) as $name) {
         is_dir($dir . '/' . $name) ? $rm($dir . '/' . $name) : @unlink($dir . '/' . $name);
